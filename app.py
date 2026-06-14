@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import re
+import threading
 import time
 import wave
 from io import BytesIO
@@ -9,8 +11,7 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.4-clean-download-ui-20260614"
-SAFE_DOWNLOAD_FILENAME = "BAM_mastered_48k_24bit.wav"
+APP_BUILD_ID = "v8.5.4.5-clean-progress-singlebar-20260614"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
 
@@ -28,8 +29,6 @@ def _secret(name: str, default: str = "") -> str:
 
 
 def _service_config() -> Dict[str, str]:
-    # Public-facing names are preferred. Older PRIVATE_WORKER_* names are accepted
-    # only as compatibility fallback so existing deployments do not break.
     return {
         "url": _secret("SERVICE_ENDPOINT_URL") or _secret("PRIVATE_WORKER_URL"),
         "token": _secret("SERVICE_ACCESS_TOKEN") or _secret("PRIVATE_WORKER_TOKEN"),
@@ -69,7 +68,7 @@ def _request_json(method: str, url: str, token: str, timeout: float, *, retries:
         except requests.RequestException as exc:
             last_error = f"서비스 연결에 실패했습니다: {exc}"
             if attempt < retries:
-                time.sleep(1.2)
+                time.sleep(1.0)
                 continue
             raise ServiceError(last_error) from exc
         if resp.status_code < 400:
@@ -83,9 +82,9 @@ def _request_json(method: str, url: str, token: str, timeout: float, *, retries:
         if resp.status_code == 429 and attempt < retries:
             retry_after = resp.headers.get("Retry-After", "")
             try:
-                wait_sec = min(8.0, max(1.5, float(retry_after))) if retry_after else 2.0 + attempt
+                wait_sec = min(10.0, max(1.5, float(retry_after))) if retry_after else min(10.0, 2.0 + attempt)
             except Exception:
-                wait_sec = 2.0 + attempt
+                wait_sec = min(10.0, 2.0 + attempt)
             time.sleep(wait_sec)
             continue
         raise ServiceError(_friendly_http_error(resp.status_code, resp.text or ""))
@@ -108,13 +107,13 @@ def _upload_to_signed_url(url: str, data: bytes, content_type: str) -> None:
 
 
 def _format_duration(seconds: Optional[float]) -> str:
-    if seconds is None or not math.isfinite(float(seconds)) or float(seconds) <= 0:
-        return "-"
-    seconds = int(round(float(seconds)))
+    if seconds is None or not math.isfinite(float(seconds)) or float(seconds) < 0:
+        return "0초"
+    seconds = int(float(seconds))
     minutes, sec = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     if hours:
-        return f"{hours}시간 {minutes}분"
+        return f"{hours}시간 {minutes}분 {sec}초"
     if minutes:
         return f"{minutes}분 {sec}초"
     return f"{sec}초"
@@ -139,38 +138,85 @@ def _estimate_processing_sec(data: bytes, duration_sec: Optional[float]) -> floa
     return max(90.0, min(3600.0, size_mb * 18.0 + 75.0))
 
 
-def _update_progress(progress_box: Any, status_box: Any, pct: int, text: str, started_at: Optional[float] = None, estimate_sec: Optional[float] = None) -> None:
-    pct = max(0, min(100, int(pct)))
-    progress_box.progress(pct)
-    extra = []
-    if started_at:
-        extra.append(f"경과 시간: {_format_duration(time.time() - started_at)}")
-    if estimate_sec:
-        extra.append(f"예상 소요시간: 약 {_format_duration(estimate_sec)}")
-    suffix = " · ".join(extra)
-    status_box.info(text + (f"\n\n{suffix}" if suffix else ""))
+def _download_filename_from_original(name: str) -> str:
+    base = str(name or "BAM_mastered.wav").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if "." in base:
+        stem = ".".join(base.split(".")[:-1]) or base
+    else:
+        stem = base
+    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem).strip(" ._") or "mastered"
+    return f"{stem}_BAM_mastered_48k_24bit.wav"
 
 
-def start_job(uploaded_file: Any, user_note: str, progress_box: Any, status_box: Any) -> Dict[str, Any]:
+def _job_is_done(payload: Dict[str, Any]) -> bool:
+    return str(payload.get("status", "")).lower() in {"done", "completed", "success"}
+
+
+def _job_is_failed(payload: Dict[str, Any]) -> bool:
+    return str(payload.get("status", "")).lower() in {"failed", "error"}
+
+
+def _job_is_active(payload: Dict[str, Any]) -> bool:
+    if not payload:
+        return False
+    return not (_job_is_done(payload) or _job_is_failed(payload))
+
+
+def _poll_job(job_id: str) -> Optional[Dict[str, Any]]:
+    if not job_id:
+        return None
+    cfg = _service_config()
+    if not cfg["url"]:
+        return None
+    try:
+        return _request_json("GET", _api_url(cfg["url"], f"/v1/jobs/{job_id}"), cfg["token"], float(cfg["timeout"] or 60), retries=1)
+    except ServiceError:
+        return None
+
+
+def _start_worker_request(job_id: str, user_note: str) -> None:
+    cfg = _service_config()
+    try:
+        _request_json(
+            "POST",
+            _api_url(cfg["url"], f"/v1/jobs/{job_id}/start"),
+            cfg["token"],
+            float(cfg["start_timeout"] or 3600),
+            retries=3,
+            json={"mode": DEFAULT_MODE, "user_note": user_note or ""},
+        )
+    except Exception:
+        # The UI polls persisted job state, so the thread should not crash Streamlit.
+        pass
+
+
+def _launch_start_thread(job_id: str, user_note: str) -> None:
+    current = st.session_state.get("busy_start_thread")
+    if current is not None and getattr(current, "is_alive", lambda: False)():
+        return
+    thread = threading.Thread(target=_start_worker_request, args=(job_id, user_note or ""), daemon=True)
+    st.session_state.busy_start_thread = thread
+    thread.start()
+
+
+def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
     cfg = _service_config()
     if not cfg["url"]:
         raise ServiceError("서비스 주소가 설정되지 않았습니다.")
-    token = cfg["token"]
-    timeout = float(cfg["timeout"] or 60)
-    start_timeout = float(cfg["start_timeout"] or 3600)
     data = uploaded_file.getvalue()
-    content_type = uploaded_file.type or "audio/wav"
-    started_at = time.time()
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        raise ServiceError(f"파일이 너무 큽니다: {size_mb:.1f} MB / 제한 {MAX_UPLOAD_MB} MB")
     duration_sec = _read_wav_duration_sec(data)
     estimate_sec = _estimate_processing_sec(data, duration_sec)
-
-    _update_progress(progress_box, status_box, 5, "파일을 확인하는 중입니다.", started_at, estimate_sec)
+    content_type = uploaded_file.type or "audio/wav"
+    started_at = time.time()
 
     init_payload = _request_json(
         "POST",
         _api_url(cfg["url"], "/v1/jobs/init"),
-        token,
-        timeout,
+        cfg["token"],
+        float(cfg["timeout"] or 60),
         retries=1,
         json={
             "filename": uploaded_file.name,
@@ -186,62 +232,62 @@ def start_job(uploaded_file: Any, user_note: str, progress_box: Any, status_box:
     if not signed_url or not job_id:
         raise ServiceError("업로드 준비 응답이 올바르지 않습니다.")
 
-    # Store job id immediately after init. If the long start request finishes
-    # on the service but the browser/Streamlit request is interrupted, the user
-    # can still press refresh and recover the finished job.
     st.session_state.busy_job_id = job_id
+    st.session_state.busy_started_at = started_at
+    st.session_state.busy_estimate_sec = estimate_sec
+    st.session_state.busy_original_filename = uploaded_file.name
+    st.session_state.busy_download_filename = _download_filename_from_original(uploaded_file.name)
+    st.session_state.busy_download_bytes = b""
     st.session_state.busy_job_payload = {
         **init_payload,
         "job_id": job_id,
         "status": "uploading",
         "stage": "uploading",
-        "progress_pct": 18,
-        "client_estimated_sec": round(estimate_sec, 3),
+        "progress_pct": 10,
     }
 
-    _update_progress(progress_box, status_box, 18, "업로드를 준비하는 중입니다.", started_at, estimate_sec)
     _upload_to_signed_url(signed_url, data, content_type)
-    st.session_state.busy_job_payload.update({"status": "uploaded", "stage": "uploaded", "progress_pct": 38})
-    _update_progress(progress_box, status_box, 38, "파일 업로드가 완료됐습니다.", started_at, estimate_sec)
-
-    _update_progress(progress_box, status_box, 45, "마스터링을 시작하는 중입니다.", started_at, estimate_sec)
-    try:
-        payload = _request_json(
-            "POST",
-            _api_url(cfg["url"], f"/v1/jobs/{job_id}/start"),
-            token,
-            start_timeout,
-            retries=0,
-            json={"mode": DEFAULT_MODE, "user_note": user_note or ""},
-        )
-    except ServiceError:
-        # If the service completed but the long HTTP response was lost, recover
-        # the latest persisted state before showing the error.
-        try:
-            recovered = get_job(job_id)
-        except Exception:
-            raise
-        recovered.setdefault("client_elapsed_sec", round(time.time() - started_at, 3))
-        recovered.setdefault("client_estimated_sec", round(estimate_sec, 3))
-        return recovered
-    payload.setdefault("client_elapsed_sec", round(time.time() - started_at, 3))
-    payload.setdefault("client_estimated_sec", round(estimate_sec, 3))
-    return payload
+    st.session_state.busy_job_payload.update({"status": "processing", "stage": "mastering", "progress_pct": 20})
+    _launch_start_thread(job_id, user_note)
 
 
-def get_job(job_id: str) -> Dict[str, Any]:
+def _display_job(payload: Dict[str, Any]) -> None:
+    started_at = float(st.session_state.get("busy_started_at") or time.time())
+    elapsed = time.time() - started_at
+    estimate_sec = float(st.session_state.get("busy_estimate_sec") or 900.0)
+
+    if _job_is_done(payload):
+        progress = 100
+        st.progress(progress)
+        st.success(f"마스터링이 완료됐습니다. · 경과 시간: {_format_duration(elapsed)}")
+        return
+
+    if _job_is_failed(payload):
+        st.progress(100)
+        st.error("마스터링에 실패했습니다.")
+        msg = str(payload.get("message") or payload.get("error_tail") or "")
+        if msg:
+            st.caption(msg[:1000])
+        return
+
+    worker_progress = payload.get("progress_pct")
+    estimated_progress = 20
+    if estimate_sec > 0:
+        estimated_progress = int(min(95, max(20, (elapsed / estimate_sec) * 95)))
+    if isinstance(worker_progress, (int, float)):
+        progress = max(int(worker_progress), estimated_progress)
+    else:
+        progress = estimated_progress
+    progress = max(1, min(95, progress))
+    st.progress(progress)
+    st.info(f"마스터링 중입니다. · 경과 시간: {_format_duration(elapsed)}")
+
+
+def _download_result(job_id: str, download_url: Optional[str] = None) -> bytes:
     cfg = _service_config()
-    if not cfg["url"]:
-        raise ServiceError("서비스 주소가 설정되지 않았습니다.")
     timeout = float(cfg["timeout"] or 60)
-    return _request_json("GET", _api_url(cfg["url"], f"/v1/jobs/{job_id}"), cfg["token"], timeout, retries=1)
-
-
-def download_result(job_id: str, download_url: Optional[str] = None) -> bytes:
-    cfg = _service_config()
-    timeout = float(cfg["timeout"] or 60)
-    if download_url and download_url.startswith(("http://", "https://")):
-        url = download_url
+    if download_url and str(download_url).startswith(("http://", "https://")):
+        url = str(download_url)
         headers: Dict[str, str] = {}
     else:
         if not cfg["url"]:
@@ -257,64 +303,15 @@ def download_result(job_id: str, download_url: Optional[str] = None) -> bytes:
     return resp.content
 
 
-def render_status(payload: Dict[str, Any]) -> None:
-    status = str(payload.get("status", "unknown")).lower()
-    stage = str(payload.get("stage", ""))
-    message = str(payload.get("message", ""))
-    progress = payload.get("progress_pct")
-    elapsed = payload.get("elapsed_sec", payload.get("client_elapsed_sec"))
-    estimate = payload.get("estimated_processing_sec", payload.get("client_estimated_sec"))
-
-    if status in {"done", "completed", "success"}:
-        st.success("마스터링이 완료됐습니다.")
-    elif status in {"failed", "error"}:
-        st.error("마스터링에 실패했습니다.")
-    elif status in {"waiting_upload"}:
-        st.info("업로드를 기다리는 중입니다.")
-    else:
-        st.info("마스터링 중입니다.")
-
-    if isinstance(progress, (int, float)):
-        st.progress(max(0, min(100, int(progress))))
-
-    cols = st.columns(3)
-    if stage:
-        cols[0].metric("현재 단계", _stage_label(stage))
-    if isinstance(elapsed, (int, float)):
-        cols[1].metric("경과 시간", _format_duration(float(elapsed)))
-    if isinstance(estimate, (int, float)):
-        cols[2].metric("예상 소요시간", f"약 {_format_duration(float(estimate))}")
-
-    if message:
-        st.caption(_clean_message(message))
-
-
-def _stage_label(stage: str) -> str:
-    table = {
-        "starting": "준비 중",
-        "private_assets_ready": "준비 완료",
-        "mastering": "분석/마스터링 중",
-        "completed": "완료",
-        "failed": "실패",
-        "timeout": "시간 초과",
-        "exception": "오류",
-        "waiting_upload": "업로드 대기",
-        "uploading": "업로드 중",
-        "uploaded": "업로드 완료",
-        "processing": "처리 중",
-    }
-    return table.get(str(stage).lower(), str(stage))
-
-
-def _clean_message(message: str) -> str:
-    replacements = {
-        "Private worker started.": "처리를 시작했습니다.",
-        "Private assets loaded.": "처리 준비가 완료됐습니다.",
-        "Analysis and mastering are running in the private worker.": "분석과 마스터링을 진행 중입니다.",
-        "Mastering completed.": "마스터링이 완료됐습니다.",
-        "Upload WAV to signed_upload_url, then call /start.": "업로드를 준비했습니다.",
-    }
-    return replacements.get(message, message)
+def _reset_if_new_upload(uploaded_name: str) -> None:
+    prev = st.session_state.get("busy_last_uploaded_name")
+    if prev and prev != uploaded_name and _job_is_done(st.session_state.get("busy_job_payload") or {}):
+        for key in [
+            "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
+            "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
+        ]:
+            st.session_state.pop(key, None)
+    st.session_state.busy_last_uploaded_name = uploaded_name
 
 
 def main() -> None:
@@ -326,80 +323,57 @@ def main() -> None:
         st.warning("서비스 설정이 필요합니다.")
 
     uploaded = st.file_uploader("WAV 파일 업로드", type=["wav"], accept_multiple_files=False)
-    user_note = st.text_area("장르/스타일태그(선택)", value="", height=70, placeholder="비워두면 자동으로 처리됩니다.")
-
-    if "busy_job_id" not in st.session_state:
-        st.session_state.busy_job_id = ""
-    if "busy_job_payload" not in st.session_state:
-        st.session_state.busy_job_payload = {}
+    user_note = st.text_area("선택 메모", value="", height=70, placeholder="비워두면 자동으로 처리됩니다.")
 
     if uploaded is not None:
+        _reset_if_new_upload(uploaded.name)
         file_data = uploaded.getvalue()
         size_mb = len(file_data) / (1024 * 1024)
         duration_sec = _read_wav_duration_sec(file_data)
-        estimate_sec = _estimate_processing_sec(file_data, duration_sec)
-        cols = st.columns(3)
+        cols = st.columns(2)
         cols[0].metric("파일 크기", f"{size_mb:.1f} MB")
         cols[1].metric("곡 길이", _format_duration(duration_sec))
-        cols[2].metric("예상 소요시간", f"약 {_format_duration(estimate_sec)}")
 
-    start = st.button("마스터링 시작", type="primary", disabled=uploaded is None or not cfg["url"])
+    payload = st.session_state.get("busy_job_payload") or {}
+    active = _job_is_active(payload)
+    start_disabled = uploaded is None or not cfg["url"] or active
+    start_clicked = st.button("마스터링 시작", type="primary", disabled=start_disabled)
 
-    progress_box = st.empty()
-    status_box = st.empty()
-
-    if start and uploaded is not None:
-        file_data = uploaded.getvalue()
-        size_mb = len(file_data) / (1024 * 1024)
-        if size_mb > MAX_UPLOAD_MB:
-            st.error(f"파일이 너무 큽니다: {size_mb:.1f} MB / 제한 {MAX_UPLOAD_MB} MB")
+    if start_clicked and uploaded is not None:
+        try:
+            _init_upload_and_start(uploaded, user_note)
+        except ServiceError as exc:
+            st.error(str(exc))
         else:
-            try:
-                payload = start_job(uploaded, user_note, progress_box, status_box)
-            except ServiceError as exc:
-                st.error(str(exc))
-                if st.session_state.busy_job_id and st.session_state.busy_job_payload:
-                    render_status(st.session_state.busy_job_payload)
-            else:
-                job_id = str(payload.get("job_id", ""))
-                st.session_state.busy_job_id = job_id
-                st.session_state.busy_job_payload = payload
-                render_status(payload)
+            st.rerun()
 
-    payload = st.session_state.busy_job_payload or {}
-    if payload and not start:
-        # Quietly recover the latest state on rerun without exposing a manual refresh button.
-        job_id_for_status = str(payload.get("job_id") or st.session_state.busy_job_id or "")
-        status_now = str(payload.get("status", "")).lower()
-        if job_id_for_status and status_now not in {"done", "completed", "success", "failed", "error"}:
-            try:
-                latest = get_job(job_id_for_status)
-            except ServiceError:
-                latest = payload
-            else:
-                payload = latest
-                st.session_state.busy_job_payload = latest
-        render_status(payload)
-    status = str(payload.get("status", "")).lower()
-    if status in {"done", "completed", "success"}:
-        job_id = str(payload.get("job_id") or st.session_state.busy_job_id)
-        download_url = payload.get("download_url")
-        cache_key = f"busy_download_bytes_{job_id}"
-        if cache_key not in st.session_state:
-            try:
-                st.session_state[cache_key] = download_result(job_id, str(download_url or ""))
-            except ServiceError as exc:
-                st.error(str(exc))
-                st.session_state[cache_key] = b""
-        mastered = st.session_state.get(cache_key, b"")
-        if mastered:
-            st.download_button(
-                "마스터링 WAV 다운로드",
-                data=mastered,
-                file_name=SAFE_DOWNLOAD_FILENAME,
-                mime="audio/wav",
-                type="primary",
-            )
+    job_id = str(st.session_state.get("busy_job_id") or "")
+    if job_id:
+        latest = _poll_job(job_id)
+        if latest:
+            st.session_state.busy_job_payload = latest
+            payload = latest
+        _display_job(payload)
+
+        if _job_is_done(payload):
+            download_url = payload.get("download_url")
+            if not st.session_state.get("busy_download_bytes"):
+                try:
+                    st.session_state.busy_download_bytes = _download_result(job_id, str(download_url or ""))
+                except ServiceError as exc:
+                    st.error(str(exc))
+                    st.session_state.busy_download_bytes = b""
+            if st.session_state.get("busy_download_bytes"):
+                st.download_button(
+                    "마스터링 WAV 다운로드",
+                    data=st.session_state.busy_download_bytes,
+                    file_name=st.session_state.get("busy_download_filename") or "BAM_mastered_48k_24bit.wav",
+                    mime="audio/wav",
+                    type="primary",
+                )
+        elif _job_is_active(payload):
+            time.sleep(1)
+            st.rerun()
 
 
 if __name__ == "__main__":
