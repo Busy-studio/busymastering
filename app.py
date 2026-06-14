@@ -323,7 +323,7 @@ def main() -> None:
         st.warning("서비스 설정이 필요합니다.")
 
     uploaded = st.file_uploader("WAV 파일 업로드", type=["wav"], accept_multiple_files=False)
-    user_note = st.text_area("선택 메모", value="", height=70, placeholder="비워두면 자동으로 처리됩니다.")
+    user_note = st.text_area("장르/스타일 태그(선택)", value="", height=70, placeholder="비워두면 자동으로 처리됩니다.")
 
     if uploaded is not None:
         _reset_if_new_upload(uploaded.name)
