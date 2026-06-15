@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.5-clean-progress-singlebar-20260614"
+APP_BUILD_ID = "v8.5.4.7-public-ui-full-20260615"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
 
@@ -131,11 +131,19 @@ def _read_wav_duration_sec(data: bytes) -> Optional[float]:
     return None
 
 
-def _estimate_processing_sec(data: bytes, duration_sec: Optional[float]) -> float:
-    size_mb = len(data) / (1024 * 1024)
-    if duration_sec and duration_sec > 0:
-        return max(90.0, min(3600.0, duration_sec * 3.9 + 60.0))
-    return max(90.0, min(3600.0, size_mb * 18.0 + 75.0))
+def _payload_estimate_sec(payload: Dict[str, Any]) -> Optional[float]:
+    value = payload.get("estimated_processing_sec")
+    if value is None and isinstance(payload.get("processing_estimate"), dict):
+        value = payload["processing_estimate"].get("estimated_processing_sec")
+    try:
+        if value is None:
+            return None
+        value_f = float(value)
+        if value_f > 0 and math.isfinite(value_f):
+            return value_f
+    except Exception:
+        return None
+    return None
 
 
 def _download_filename_from_original(name: str) -> str:
@@ -208,7 +216,6 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
     if size_mb > MAX_UPLOAD_MB:
         raise ServiceError(f"파일이 너무 큽니다: {size_mb:.1f} MB / 제한 {MAX_UPLOAD_MB} MB")
     duration_sec = _read_wav_duration_sec(data)
-    estimate_sec = _estimate_processing_sec(data, duration_sec)
     content_type = uploaded_file.type or "audio/wav"
     started_at = time.time()
 
@@ -221,6 +228,7 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
         json={
             "filename": uploaded_file.name,
             "size_bytes": len(data),
+            "audio_duration_sec": duration_sec,
             "content_type": content_type,
             "mode": DEFAULT_MODE,
             "user_note": user_note or "",
@@ -234,7 +242,7 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
 
     st.session_state.busy_job_id = job_id
     st.session_state.busy_started_at = started_at
-    st.session_state.busy_estimate_sec = estimate_sec
+    st.session_state.busy_estimate_sec = _payload_estimate_sec(init_payload)
     st.session_state.busy_original_filename = uploaded_file.name
     st.session_state.busy_download_filename = _download_filename_from_original(uploaded_file.name)
     st.session_state.busy_download_bytes = b""
@@ -253,13 +261,18 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
 
 def _display_job(payload: Dict[str, Any]) -> None:
     started_at = float(st.session_state.get("busy_started_at") or time.time())
-    elapsed = time.time() - started_at
-    estimate_sec = float(st.session_state.get("busy_estimate_sec") or 900.0)
+    elapsed = max(0.0, time.time() - started_at)
+    estimate_raw = st.session_state.get("busy_estimate_sec")
+    if estimate_raw is None:
+        estimate_raw = _payload_estimate_sec(payload)
+    try:
+        estimate_sec = float(estimate_raw) if estimate_raw is not None else None
+    except Exception:
+        estimate_sec = None
 
     if _job_is_done(payload):
-        progress = 100
-        st.progress(progress)
-        st.success(f"마스터링이 완료됐습니다. · 경과 시간: {_format_duration(elapsed)}")
+        st.progress(100)
+        st.success("마스터링이 완료되었습니다.")
         return
 
     if _job_is_failed(payload):
@@ -272,15 +285,19 @@ def _display_job(payload: Dict[str, Any]) -> None:
 
     worker_progress = payload.get("progress_pct")
     estimated_progress = 20
-    if estimate_sec > 0:
+    if estimate_sec and estimate_sec > 0:
         estimated_progress = int(min(95, max(20, (elapsed / estimate_sec) * 95)))
     if isinstance(worker_progress, (int, float)):
         progress = max(int(worker_progress), estimated_progress)
     else:
         progress = estimated_progress
     progress = max(1, min(95, progress))
+
+    if estimate_sec and estimate_sec > 0:
+        st.info(f"마스터링 중 [{_format_duration(elapsed)} / 약 {_format_duration(estimate_sec)}]")
+    else:
+        st.info(f"마스터링 중 [{_format_duration(elapsed)}]")
     st.progress(progress)
-    st.info(f"마스터링 중입니다. · 경과 시간: {_format_duration(elapsed)}")
 
 
 def _download_result(job_id: str, download_url: Optional[str] = None) -> bytes:
@@ -334,7 +351,14 @@ def main() -> None:
         cols[0].metric("파일 크기", f"{size_mb:.1f} MB")
         cols[1].metric("곡 길이", _format_duration(duration_sec))
 
+    job_id = str(st.session_state.get("busy_job_id") or "")
     payload = st.session_state.get("busy_job_payload") or {}
+    if job_id:
+        latest = _poll_job(job_id)
+        if latest:
+            st.session_state.busy_job_payload = latest
+            payload = latest
+
     active = _job_is_active(payload)
     start_disabled = uploaded is None or not cfg["url"] or active
     start_clicked = st.button("마스터링 시작", type="primary", disabled=start_disabled)
@@ -348,11 +372,8 @@ def main() -> None:
             st.rerun()
 
     job_id = str(st.session_state.get("busy_job_id") or "")
+    payload = st.session_state.get("busy_job_payload") or payload
     if job_id:
-        latest = _poll_job(job_id)
-        if latest:
-            st.session_state.busy_job_payload = latest
-            payload = latest
         _display_job(payload)
 
         if _job_is_done(payload):
