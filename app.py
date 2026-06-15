@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import html as html_lib
 import threading
 import time
 import wave
@@ -10,8 +11,9 @@ from typing import Any, Dict, Optional
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
-APP_BUILD_ID = "v8.5.4.7-public-ui-full-20260615"
+APP_BUILD_ID = "v8.5.4.9-public-ui-live-elapsed-nonblocking-poll-20260616"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
 
@@ -34,7 +36,29 @@ def _service_config() -> Dict[str, str]:
         "token": _secret("SERVICE_ACCESS_TOKEN") or _secret("PRIVATE_WORKER_TOKEN"),
         "timeout": _secret("SERVICE_TIMEOUT_SEC", _secret("PRIVATE_WORKER_TIMEOUT_SEC", "60")),
         "start_timeout": _secret("SERVICE_START_TIMEOUT_SEC", _secret("PRIVATE_WORKER_START_TIMEOUT_SEC", "3600")),
+        "poll_timeout": _secret("SERVICE_POLL_TIMEOUT_SEC", "2.0"),
+        "poll_interval": _secret("SERVICE_STATUS_POLL_INTERVAL_SEC", "5.0"),
     }
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        value_f = float(value)
+        if math.isfinite(value_f):
+            return value_f
+    except Exception:
+        pass
+    return float(default)
+
+
+def _poll_timeout_sec() -> float:
+    cfg = _service_config()
+    return max(0.8, min(8.0, _safe_float(cfg.get("poll_timeout"), 2.0)))
+
+
+def _poll_interval_sec() -> float:
+    cfg = _service_config()
+    return max(2.0, min(20.0, _safe_float(cfg.get("poll_interval"), 5.0)))
 
 
 def _headers(token: str) -> Dict[str, str]:
@@ -170,16 +194,26 @@ def _job_is_active(payload: Dict[str, Any]) -> bool:
     return not (_job_is_done(payload) or _job_is_failed(payload))
 
 
-def _poll_job(job_id: str) -> Optional[Dict[str, Any]]:
+def _poll_job(job_id: str, *, timeout_sec: Optional[float] = None) -> Optional[Dict[str, Any]]:
     if not job_id:
         return None
     cfg = _service_config()
     if not cfg["url"]:
         return None
+    timeout = _safe_float(timeout_sec, _poll_timeout_sec()) if timeout_sec is not None else _poll_timeout_sec()
     try:
-        return _request_json("GET", _api_url(cfg["url"], f"/v1/jobs/{job_id}"), cfg["token"], float(cfg["timeout"] or 60), retries=1)
+        return _request_json("GET", _api_url(cfg["url"], f"/v1/jobs/{job_id}"), cfg["token"], timeout, retries=0)
     except ServiceError:
         return None
+
+
+def _status_poll_due() -> bool:
+    now = time.time()
+    last = _safe_float(st.session_state.get("busy_last_status_poll_at"), 0.0)
+    if now - last < _poll_interval_sec():
+        return False
+    st.session_state.busy_last_status_poll_at = now
+    return True
 
 
 def _start_worker_request(job_id: str, user_note: str) -> None:
@@ -205,6 +239,65 @@ def _launch_start_thread(job_id: str, user_note: str) -> None:
     thread = threading.Thread(target=_start_worker_request, args=(job_id, user_note or ""), daemon=True)
     st.session_state.busy_start_thread = thread
     thread.start()
+
+
+def _render_live_progress_component(*, started_at: float, estimate_sec: Optional[float], worker_progress: Optional[float]) -> None:
+    """Browser-side elapsed timer so the visible elapsed time keeps moving even when status polling is slow."""
+    started_ms = int(float(started_at) * 1000)
+    estimate_js = "null" if estimate_sec is None or not math.isfinite(float(estimate_sec)) or float(estimate_sec) <= 0 else f"{float(estimate_sec):.3f}"
+    worker_js = "null" if worker_progress is None or not isinstance(worker_progress, (int, float)) else f"{float(worker_progress):.3f}"
+    components.html(
+        f"""
+<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <div id="bam-status-box" style="background:#f0f7ff;border-radius:8px;padding:13px 14px;margin:0 0 10px 0;color:#4f7ea8;font-size:15px;">
+    마스터링 중 [<span id="bam-elapsed">0초</span><span id="bam-estimate-wrap"></span>]
+  </div>
+  <div style="height:8px;background:#f4f6f8;border-radius:999px;overflow:hidden;">
+    <div id="bam-progress-fill" style="height:8px;width:1%;background:#b8dcfb;border-radius:999px;transition:width 0.5s ease;"></div>
+  </div>
+</div>
+<script>
+(function() {{
+  const startedAtMs = {started_ms};
+  const estimateSec = {estimate_js};
+  const workerProgress = {worker_js};
+  const elapsedEl = document.getElementById('bam-elapsed');
+  const estimateWrap = document.getElementById('bam-estimate-wrap');
+  const fill = document.getElementById('bam-progress-fill');
+
+  function fmt(sec) {{
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h > 0) return `${{h}}시간 ${{m}}분 ${{s}}초`;
+    if (m > 0) return `${{m}}분 ${{s}}초`;
+    return `${{s}}초`;
+  }}
+
+  function tick() {{
+    const elapsed = Math.max(0, (Date.now() - startedAtMs) / 1000.0);
+    elapsedEl.textContent = fmt(elapsed);
+    let progress = 20;
+    if (estimateSec && estimateSec > 0) {{
+      estimateWrap.textContent = ' / 약 ' + fmt(estimateSec);
+      progress = Math.min(95, Math.max(20, (elapsed / estimateSec) * 95));
+    }} else {{
+      estimateWrap.textContent = '';
+    }}
+    if (workerProgress !== null && Number.isFinite(workerProgress)) {{
+      progress = Math.max(progress, workerProgress);
+    }}
+    progress = Math.min(95, Math.max(1, progress));
+    fill.style.width = progress.toFixed(1) + '%';
+  }}
+  tick();
+  setInterval(tick, 1000);
+}})();
+</script>
+        """,
+        height=78,
+    )
 
 
 def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
@@ -246,6 +339,7 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
     st.session_state.busy_original_filename = uploaded_file.name
     st.session_state.busy_download_filename = _download_filename_from_original(uploaded_file.name)
     st.session_state.busy_download_bytes = b""
+    st.session_state.busy_last_status_poll_at = 0.0
     st.session_state.busy_job_payload = {
         **init_payload,
         "job_id": job_id,
@@ -262,9 +356,9 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
 def _display_job(payload: Dict[str, Any]) -> None:
     started_at = float(st.session_state.get("busy_started_at") or time.time())
     elapsed = max(0.0, time.time() - started_at)
-    estimate_raw = st.session_state.get("busy_estimate_sec")
+    estimate_raw = _payload_estimate_sec(payload)
     if estimate_raw is None:
-        estimate_raw = _payload_estimate_sec(payload)
+        estimate_raw = st.session_state.get("busy_estimate_sec")
     try:
         estimate_sec = float(estimate_raw) if estimate_raw is not None else None
     except Exception:
@@ -284,20 +378,12 @@ def _display_job(payload: Dict[str, Any]) -> None:
         return
 
     worker_progress = payload.get("progress_pct")
-    estimated_progress = 20
-    if estimate_sec and estimate_sec > 0:
-        estimated_progress = int(min(95, max(20, (elapsed / estimate_sec) * 95)))
-    if isinstance(worker_progress, (int, float)):
-        progress = max(int(worker_progress), estimated_progress)
+    worker_progress_f: Optional[float]
+    if isinstance(worker_progress, (int, float)) and math.isfinite(float(worker_progress)):
+        worker_progress_f = float(worker_progress)
     else:
-        progress = estimated_progress
-    progress = max(1, min(95, progress))
-
-    if estimate_sec and estimate_sec > 0:
-        st.info(f"마스터링 중 [{_format_duration(elapsed)} / 약 {_format_duration(estimate_sec)}]")
-    else:
-        st.info(f"마스터링 중 [{_format_duration(elapsed)}]")
-    st.progress(progress)
+        worker_progress_f = None
+    _render_live_progress_component(started_at=started_at, estimate_sec=estimate_sec, worker_progress=worker_progress_f)
 
 
 def _download_result(job_id: str, download_url: Optional[str] = None) -> bytes:
@@ -320,12 +406,69 @@ def _download_result(job_id: str, download_url: Optional[str] = None) -> bytes:
     return resp.content
 
 
+def _render_done_download(job_id: str, payload: Dict[str, Any]) -> None:
+    download_url = payload.get("download_url")
+    if not st.session_state.get("busy_download_bytes"):
+        try:
+            st.session_state.busy_download_bytes = _download_result(job_id, str(download_url or ""))
+        except ServiceError as exc:
+            st.error(str(exc))
+            st.session_state.busy_download_bytes = b""
+    if st.session_state.get("busy_download_bytes"):
+        st.download_button(
+            "마스터링 WAV 다운로드",
+            data=st.session_state.busy_download_bytes,
+            file_name=st.session_state.get("busy_download_filename") or "BAM_mastered_48k_24bit.wav",
+            mime="audio/wav",
+            type="primary",
+        )
+
+
+def _render_job_status_panel() -> None:
+    job_id = str(st.session_state.get("busy_job_id") or "")
+    if not job_id:
+        return
+
+    payload = st.session_state.get("busy_job_payload") or {}
+    is_active = _job_is_active(payload)
+
+    # Render from cached state first. This keeps the elapsed timer responsive even if the
+    # status endpoint is temporarily busy or slow. Polling is intentionally short-timeout
+    # and throttled, so a blocked status request cannot freeze the visible timer.
+    _display_job(payload)
+
+    if _job_is_done(payload):
+        _render_done_download(job_id, payload)
+        return
+
+    if not is_active:
+        return
+
+    if _status_poll_due():
+        latest = _poll_job(job_id, timeout_sec=_poll_timeout_sec())
+        if latest:
+            previous_status = str(payload.get("status", "")).lower()
+            latest_status = str(latest.get("status", "")).lower()
+            st.session_state.busy_job_payload = latest
+            if latest_status != previous_status or _job_is_done(latest) or _job_is_failed(latest):
+                st.rerun()
+
+
+@st.fragment(run_every="1s")
+def _live_job_status_panel() -> None:
+    # Fragment refresh keeps the page interactive while the status area updates every second.
+    # Avoid a top-level sleep/rerun loop because Streamlit renders the whole page as busy/disabled while the script is running.
+    _render_job_status_panel()
+
+
+
+
 def _reset_if_new_upload(uploaded_name: str) -> None:
     prev = st.session_state.get("busy_last_uploaded_name")
     if prev and prev != uploaded_name and _job_is_done(st.session_state.get("busy_job_payload") or {}):
         for key in [
             "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
-            "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
+            "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread", "busy_last_status_poll_at",
         ]:
             st.session_state.pop(key, None)
     st.session_state.busy_last_uploaded_name = uploaded_name
@@ -353,12 +496,6 @@ def main() -> None:
 
     job_id = str(st.session_state.get("busy_job_id") or "")
     payload = st.session_state.get("busy_job_payload") or {}
-    if job_id:
-        latest = _poll_job(job_id)
-        if latest:
-            st.session_state.busy_job_payload = latest
-            payload = latest
-
     active = _job_is_active(payload)
     start_disabled = uploaded is None or not cfg["url"] or active
     start_clicked = st.button("마스터링 시작", type="primary", disabled=start_disabled)
@@ -374,27 +511,10 @@ def main() -> None:
     job_id = str(st.session_state.get("busy_job_id") or "")
     payload = st.session_state.get("busy_job_payload") or payload
     if job_id:
-        _display_job(payload)
-
-        if _job_is_done(payload):
-            download_url = payload.get("download_url")
-            if not st.session_state.get("busy_download_bytes"):
-                try:
-                    st.session_state.busy_download_bytes = _download_result(job_id, str(download_url or ""))
-                except ServiceError as exc:
-                    st.error(str(exc))
-                    st.session_state.busy_download_bytes = b""
-            if st.session_state.get("busy_download_bytes"):
-                st.download_button(
-                    "마스터링 WAV 다운로드",
-                    data=st.session_state.busy_download_bytes,
-                    file_name=st.session_state.get("busy_download_filename") or "BAM_mastered_48k_24bit.wav",
-                    mime="audio/wav",
-                    type="primary",
-                )
-        elif _job_is_active(payload):
-            time.sleep(1)
-            st.rerun()
+        if _job_is_active(payload):
+            _live_job_status_panel()
+        else:
+            _render_job_status_panel()
 
 
 if __name__ == "__main__":
