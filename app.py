@@ -13,7 +13,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-APP_BUILD_ID = "v8.5.4.9-public-ui-live-elapsed-nonblocking-poll-20260616"
+APP_BUILD_ID = "v8.5.4.10-public-ui-instant-start-feedback-20260616"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
 
@@ -216,8 +216,7 @@ def _status_poll_due() -> bool:
     return True
 
 
-def _start_worker_request(job_id: str, user_note: str) -> None:
-    cfg = _service_config()
+def _start_worker_request_with_cfg(cfg: Dict[str, str], job_id: str, user_note: str) -> None:
     try:
         _request_json(
             "POST",
@@ -232,6 +231,11 @@ def _start_worker_request(job_id: str, user_note: str) -> None:
         pass
 
 
+def _start_worker_request(job_id: str, user_note: str) -> None:
+    cfg = _service_config()
+    _start_worker_request_with_cfg(cfg, job_id, user_note)
+
+
 def _launch_start_thread(job_id: str, user_note: str) -> None:
     current = st.session_state.get("busy_start_thread")
     if current is not None and getattr(current, "is_alive", lambda: False)():
@@ -241,16 +245,190 @@ def _launch_start_thread(job_id: str, user_note: str) -> None:
     thread.start()
 
 
-def _render_live_progress_component(*, started_at: float, estimate_sec: Optional[float], worker_progress: Optional[float]) -> None:
+def _async_payload(status: str, stage: str, progress_pct: float, message: str = "") -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "status": status,
+        "stage": stage,
+        "progress_pct": progress_pct,
+    }
+    if message:
+        payload["message"] = message
+    return payload
+
+
+def _start_job_bootstrap_worker(
+    *,
+    cfg: Dict[str, str],
+    data: bytes,
+    filename: str,
+    content_type: str,
+    duration_sec: Optional[float],
+    user_note: str,
+    shared: Dict[str, Any],
+) -> None:
+    """Runs the slow init/upload/start path off the Streamlit render thread.
+
+    The main script renders an instant local progress shell first, then syncs this
+    small shared dict on each fragment refresh. The thread deliberately avoids
+    Streamlit APIs so missing ScriptRunContext warnings and UI blocking are avoided.
+    """
+    try:
+        shared.update({
+            "phase": "initializing",
+            "payload": _async_payload("initializing", "preparing", 3, "업로드 준비 중"),
+        })
+        init_payload = _request_json(
+            "POST",
+            _api_url(cfg["url"], "/v1/jobs/init"),
+            cfg["token"],
+            float(cfg["timeout"] or 60),
+            retries=1,
+            json={
+                "filename": filename,
+                "size_bytes": len(data),
+                "audio_duration_sec": duration_sec,
+                "content_type": content_type,
+                "mode": DEFAULT_MODE,
+                "user_note": user_note or "",
+                "client_build_id": APP_BUILD_ID,
+            },
+        )
+        signed_url = str(init_payload.get("signed_upload_url") or "")
+        job_id = str(init_payload.get("job_id") or "")
+        if not signed_url or not job_id:
+            raise ServiceError("업로드 준비 응답이 올바르지 않습니다.")
+
+        payload = {
+            **init_payload,
+            "job_id": job_id,
+            "status": "uploading",
+            "stage": "uploading",
+            "progress_pct": 10,
+            "message": "파일 업로드 중",
+        }
+        shared.update({
+            "phase": "uploading",
+            "job_id": job_id,
+            "estimate_sec": _payload_estimate_sec(init_payload),
+            "payload": payload,
+        })
+
+        _upload_to_signed_url(signed_url, data, content_type)
+        payload = {
+            **init_payload,
+            "job_id": job_id,
+            "status": "processing",
+            "stage": "mastering",
+            "progress_pct": 20,
+            "message": "마스터링 중",
+        }
+        shared.update({"phase": "processing", "payload": payload})
+        _start_worker_request_with_cfg(cfg, job_id, user_note)
+        shared.update({"phase": "started", "payload": payload, "done": True})
+    except Exception as exc:
+        shared.update({
+            "phase": "error",
+            "error": str(exc),
+            "done": True,
+            "payload": _async_payload("failed", "start_failed", 100, str(exc)),
+        })
+
+
+def _sync_bootstrap_state() -> None:
+    shared = st.session_state.get("busy_async_start_state")
+    if not isinstance(shared, dict):
+        return
+    payload = shared.get("payload")
+    job_id = str(shared.get("job_id") or "")
+    phase = str(shared.get("phase") or "")
+
+    if isinstance(payload, dict):
+        # Do not overwrite a terminal worker response or a newer polled worker status with
+        # the older local bootstrap payload after the real job has started.
+        current = st.session_state.get("busy_job_payload") or {}
+        current_status = str(current.get("status") or "").lower()
+        current_job_id = str(current.get("job_id") or "")
+        shared_status = str(payload.get("status") or "").lower()
+        should_update = not (_job_is_done(current) or _job_is_failed(current))
+        if (
+            should_update
+            and job_id
+            and current_job_id == job_id
+            and phase in {"processing", "started"}
+            and current_status not in {"", "initializing", "queued", "uploading"}
+            and shared_status in {"processing", "uploading", "initializing"}
+        ):
+            should_update = False
+        if should_update:
+            st.session_state.busy_job_payload = dict(payload)
+    if job_id:
+        st.session_state.busy_job_id = job_id
+    if shared.get("estimate_sec") is not None:
+        st.session_state.busy_estimate_sec = shared.get("estimate_sec")
+    if phase == "error":
+        st.session_state.busy_job_payload = dict(shared.get("payload") or _async_payload("failed", "start_failed", 100, str(shared.get("error") or "")))
+
+
+def _begin_async_start_feedback(uploaded_file: Any, user_note: str) -> None:
+    cfg = _service_config()
+    if not cfg["url"]:
+        raise ServiceError("서비스 주소가 설정되지 않았습니다.")
+    data = uploaded_file.getvalue()
+    size_mb = len(data) / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        raise ServiceError(f"파일이 너무 큽니다: {size_mb:.1f} MB / 제한 {MAX_UPLOAD_MB} MB")
+    duration_sec = _read_wav_duration_sec(data)
+    content_type = uploaded_file.type or "audio/wav"
+    filename = str(uploaded_file.name or "upload.wav")
+    started_at = time.time()
+
+    shared: Dict[str, Any] = {
+        "phase": "queued",
+        "job_id": "",
+        "estimate_sec": None,
+        "error": "",
+        "done": False,
+        "payload": _async_payload("initializing", "preparing", 3, "업로드 준비 중"),
+    }
+    st.session_state.busy_async_start_state = shared
+    st.session_state.busy_job_id = ""
+    st.session_state.busy_started_at = started_at
+    st.session_state.busy_estimate_sec = None
+    st.session_state.busy_original_filename = filename
+    st.session_state.busy_download_filename = _download_filename_from_original(filename)
+    st.session_state.busy_download_bytes = b""
+    st.session_state.busy_last_status_poll_at = 0.0
+    st.session_state.busy_job_payload = dict(shared["payload"])
+
+    thread = threading.Thread(
+        target=_start_job_bootstrap_worker,
+        kwargs={
+            "cfg": dict(cfg),
+            "data": data,
+            "filename": filename,
+            "content_type": content_type,
+            "duration_sec": duration_sec,
+            "user_note": user_note or "",
+            "shared": shared,
+        },
+        daemon=True,
+    )
+    st.session_state.busy_start_bootstrap_thread = thread
+    thread.start()
+
+
+def _render_live_progress_component(*, started_at: float, estimate_sec: Optional[float], worker_progress: Optional[float], label: str = "마스터링 중", min_progress: float = 3.0) -> None:
     """Browser-side elapsed timer so the visible elapsed time keeps moving even when status polling is slow."""
     started_ms = int(float(started_at) * 1000)
     estimate_js = "null" if estimate_sec is None or not math.isfinite(float(estimate_sec)) or float(estimate_sec) <= 0 else f"{float(estimate_sec):.3f}"
     worker_js = "null" if worker_progress is None or not isinstance(worker_progress, (int, float)) else f"{float(worker_progress):.3f}"
+    label_safe = html_lib.escape(str(label or "마스터링 중"))
+    min_progress_js = f"{max(1.0, min(30.0, float(min_progress))):.3f}"
     components.html(
         f"""
 <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
   <div id="bam-status-box" style="background:#f0f7ff;border-radius:8px;padding:13px 14px;margin:0 0 10px 0;color:#4f7ea8;font-size:15px;">
-    마스터링 중 [<span id="bam-elapsed">0초</span><span id="bam-estimate-wrap"></span>]
+    {label_safe} [<span id="bam-elapsed">0초</span><span id="bam-estimate-wrap"></span>]
   </div>
   <div style="height:8px;background:#f4f6f8;border-radius:999px;overflow:hidden;">
     <div id="bam-progress-fill" style="height:8px;width:1%;background:#b8dcfb;border-radius:999px;transition:width 0.5s ease;"></div>
@@ -261,6 +439,7 @@ def _render_live_progress_component(*, started_at: float, estimate_sec: Optional
   const startedAtMs = {started_ms};
   const estimateSec = {estimate_js};
   const workerProgress = {worker_js};
+  const minProgress = {min_progress_js};
   const elapsedEl = document.getElementById('bam-elapsed');
   const estimateWrap = document.getElementById('bam-estimate-wrap');
   const fill = document.getElementById('bam-progress-fill');
@@ -278,17 +457,17 @@ def _render_live_progress_component(*, started_at: float, estimate_sec: Optional
   function tick() {{
     const elapsed = Math.max(0, (Date.now() - startedAtMs) / 1000.0);
     elapsedEl.textContent = fmt(elapsed);
-    let progress = 20;
+    let progress = minProgress;
     if (estimateSec && estimateSec > 0) {{
       estimateWrap.textContent = ' / 약 ' + fmt(estimateSec);
-      progress = Math.min(95, Math.max(20, (elapsed / estimateSec) * 95));
+      progress = Math.min(95, Math.max(minProgress, (elapsed / estimateSec) * 95));
     }} else {{
       estimateWrap.textContent = '';
     }}
     if (workerProgress !== null && Number.isFinite(workerProgress)) {{
       progress = Math.max(progress, workerProgress);
     }}
-    progress = Math.min(95, Math.max(1, progress));
+    progress = Math.min(95, Math.max(minProgress, progress));
     fill.style.width = progress.toFixed(1) + '%';
   }}
   tick();
@@ -383,7 +562,25 @@ def _display_job(payload: Dict[str, Any]) -> None:
         worker_progress_f = float(worker_progress)
     else:
         worker_progress_f = None
-    _render_live_progress_component(started_at=started_at, estimate_sec=estimate_sec, worker_progress=worker_progress_f)
+
+    status = str(payload.get("status") or "").lower()
+    stage = str(payload.get("stage") or "").lower()
+    if status in {"initializing", "queued"} or stage in {"preparing", "start_pending"}:
+        label = "마스터링 준비 중"
+        min_progress = 3.0
+    elif status == "uploading" or stage == "uploading":
+        label = "파일 업로드 중"
+        min_progress = 10.0
+    else:
+        label = "마스터링 중"
+        min_progress = 20.0
+    _render_live_progress_component(
+        started_at=started_at,
+        estimate_sec=estimate_sec,
+        worker_progress=worker_progress_f,
+        label=label,
+        min_progress=min_progress,
+    )
 
 
 def _download_result(job_id: str, download_url: Optional[str] = None) -> bytes:
@@ -425,23 +622,25 @@ def _render_done_download(job_id: str, payload: Dict[str, Any]) -> None:
 
 
 def _render_job_status_panel() -> None:
+    _sync_bootstrap_state()
     job_id = str(st.session_state.get("busy_job_id") or "")
-    if not job_id:
+    payload = st.session_state.get("busy_job_payload") or {}
+    if not job_id and not payload:
         return
 
-    payload = st.session_state.get("busy_job_payload") or {}
     is_active = _job_is_active(payload)
 
-    # Render from cached state first. This keeps the elapsed timer responsive even if the
-    # status endpoint is temporarily busy or slow. Polling is intentionally short-timeout
-    # and throttled, so a blocked status request cannot freeze the visible timer.
+    # Render from cached/bootstrap state first. This keeps the elapsed timer responsive even if
+    # the start request, upload, or status endpoint is temporarily slow. Polling is intentionally
+    # short-timeout and throttled, so a blocked status request cannot freeze the visible timer.
     _display_job(payload)
 
     if _job_is_done(payload):
-        _render_done_download(job_id, payload)
+        if job_id:
+            _render_done_download(job_id, payload)
         return
 
-    if not is_active:
+    if not job_id or not is_active:
         return
 
     if _status_poll_due():
@@ -468,7 +667,8 @@ def _reset_if_new_upload(uploaded_name: str) -> None:
     if prev and prev != uploaded_name and _job_is_done(st.session_state.get("busy_job_payload") or {}):
         for key in [
             "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
-            "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread", "busy_last_status_poll_at",
+            "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
+            "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at",
         ]:
             st.session_state.pop(key, None)
     st.session_state.busy_last_uploaded_name = uploaded_name
@@ -494,6 +694,7 @@ def main() -> None:
         cols[0].metric("파일 크기", f"{size_mb:.1f} MB")
         cols[1].metric("곡 길이", _format_duration(duration_sec))
 
+    _sync_bootstrap_state()
     job_id = str(st.session_state.get("busy_job_id") or "")
     payload = st.session_state.get("busy_job_payload") or {}
     active = _job_is_active(payload)
@@ -502,15 +703,16 @@ def main() -> None:
 
     if start_clicked and uploaded is not None:
         try:
-            _init_upload_and_start(uploaded, user_note)
+            _begin_async_start_feedback(uploaded, user_note)
         except ServiceError as exc:
             st.error(str(exc))
         else:
             st.rerun()
 
+    _sync_bootstrap_state()
     job_id = str(st.session_state.get("busy_job_id") or "")
     payload = st.session_state.get("busy_job_payload") or payload
-    if job_id:
+    if job_id or _job_is_active(payload) or _job_is_failed(payload):
         if _job_is_active(payload):
             _live_job_status_panel()
         else:
