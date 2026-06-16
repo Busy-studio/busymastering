@@ -11,56 +11,13 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.12-public-ui-intensity-presets-20260616"
+APP_BUILD_ID = "v8.5.4.11-public-ui-native-progress-20260616"
 DEFAULT_MODE = "Auto Commercial Master"
-DEFAULT_MASTERING_INTENSITY = "commercial"
 MAX_UPLOAD_MB = 250
-
-MASTERING_INTENSITY_OPTIONS = {
-    "safe": {
-        "label": "Safe",
-        "description": "자연스럽고 안전한 음압",
-    },
-    "balanced": {
-        "label": "Balanced",
-        "description": "음압과 품질 균형",
-    },
-    "commercial": {
-        "label": "Commercial",
-        "description": "상업용 음원에 가까운 음압",
-    },
-    "maximum": {
-        "label": "Maximum",
-        "description": "가능한 한 크게",
-    },
-}
 
 
 class ServiceError(RuntimeError):
     pass
-
-
-
-def _normalize_mastering_intensity(value: Any) -> str:
-    key = str(value or DEFAULT_MASTERING_INTENSITY).strip().lower().replace(" ", "_").replace("-", "_")
-    aliases = {
-        "commercial_reference": "commercial",
-        "commercial_reference_match": "commercial",
-        "max": "maximum",
-        "loudest": "maximum",
-        "standard": "balanced",
-        "streaming": "safe",
-    }
-    key = aliases.get(key, key)
-    if key not in MASTERING_INTENSITY_OPTIONS:
-        key = DEFAULT_MASTERING_INTENSITY
-    return key
-
-
-def _intensity_display(key: str) -> str:
-    key = _normalize_mastering_intensity(key)
-    meta = MASTERING_INTENSITY_OPTIONS[key]
-    return f"{meta['label']} — {meta['description']}"
 
 
 def _secret(name: str, default: str = "") -> str:
@@ -257,7 +214,7 @@ def _status_poll_due() -> bool:
     return True
 
 
-def _start_worker_request_with_cfg(cfg: Dict[str, str], job_id: str, user_note: str, mastering_intensity: str = DEFAULT_MASTERING_INTENSITY) -> None:
+def _start_worker_request_with_cfg(cfg: Dict[str, str], job_id: str, user_note: str) -> None:
     try:
         _request_json(
             "POST",
@@ -265,23 +222,23 @@ def _start_worker_request_with_cfg(cfg: Dict[str, str], job_id: str, user_note: 
             cfg["token"],
             float(cfg["start_timeout"] or 3600),
             retries=3,
-            json={"mode": DEFAULT_MODE, "user_note": user_note or "", "mastering_intensity": _normalize_mastering_intensity(mastering_intensity)},
+            json={"mode": DEFAULT_MODE, "user_note": user_note or ""},
         )
     except Exception:
         # The UI polls persisted job state, so the thread should not crash Streamlit.
         pass
 
 
-def _start_worker_request(job_id: str, user_note: str, mastering_intensity: str = DEFAULT_MASTERING_INTENSITY) -> None:
+def _start_worker_request(job_id: str, user_note: str) -> None:
     cfg = _service_config()
-    _start_worker_request_with_cfg(cfg, job_id, user_note, mastering_intensity)
+    _start_worker_request_with_cfg(cfg, job_id, user_note)
 
 
-def _launch_start_thread(job_id: str, user_note: str, mastering_intensity: str = DEFAULT_MASTERING_INTENSITY) -> None:
+def _launch_start_thread(job_id: str, user_note: str) -> None:
     current = st.session_state.get("busy_start_thread")
     if current is not None and getattr(current, "is_alive", lambda: False)():
         return
-    thread = threading.Thread(target=_start_worker_request, args=(job_id, user_note or "", _normalize_mastering_intensity(mastering_intensity)), daemon=True)
+    thread = threading.Thread(target=_start_worker_request, args=(job_id, user_note or ""), daemon=True)
     st.session_state.busy_start_thread = thread
     thread.start()
 
@@ -305,7 +262,6 @@ def _start_job_bootstrap_worker(
     content_type: str,
     duration_sec: Optional[float],
     user_note: str,
-    mastering_intensity: str,
     shared: Dict[str, Any],
 ) -> None:
     """Runs the slow init/upload/start path off the Streamlit render thread.
@@ -332,7 +288,6 @@ def _start_job_bootstrap_worker(
                 "content_type": content_type,
                 "mode": DEFAULT_MODE,
                 "user_note": user_note or "",
-                "mastering_intensity": _normalize_mastering_intensity(mastering_intensity),
                 "client_build_id": APP_BUILD_ID,
             },
         )
@@ -366,7 +321,7 @@ def _start_job_bootstrap_worker(
             "message": "마스터링 중",
         }
         shared.update({"phase": "processing", "payload": payload})
-        _start_worker_request_with_cfg(cfg, job_id, user_note, mastering_intensity)
+        _start_worker_request_with_cfg(cfg, job_id, user_note)
         shared.update({"phase": "started", "payload": payload, "done": True})
     except Exception as exc:
         shared.update({
@@ -412,7 +367,7 @@ def _sync_bootstrap_state() -> None:
         st.session_state.busy_job_payload = dict(shared.get("payload") or _async_payload("failed", "start_failed", 100, str(shared.get("error") or "")))
 
 
-def _begin_async_start_feedback(uploaded_file: Any, user_note: str, mastering_intensity: str = DEFAULT_MASTERING_INTENSITY) -> None:
+def _begin_async_start_feedback(uploaded_file: Any, user_note: str) -> None:
     cfg = _service_config()
     if not cfg["url"]:
         raise ServiceError("서비스 주소가 설정되지 않았습니다.")
@@ -424,7 +379,6 @@ def _begin_async_start_feedback(uploaded_file: Any, user_note: str, mastering_in
     content_type = uploaded_file.type or "audio/wav"
     filename = str(uploaded_file.name or "upload.wav")
     started_at = time.time()
-    mastering_intensity = _normalize_mastering_intensity(mastering_intensity)
 
     shared: Dict[str, Any] = {
         "phase": "queued",
@@ -439,7 +393,6 @@ def _begin_async_start_feedback(uploaded_file: Any, user_note: str, mastering_in
     st.session_state.busy_started_at = started_at
     st.session_state.busy_estimate_sec = None
     st.session_state.busy_original_filename = filename
-    st.session_state.busy_mastering_intensity = mastering_intensity
     st.session_state.busy_download_filename = _download_filename_from_original(filename)
     st.session_state.busy_download_bytes = b""
     st.session_state.busy_last_status_poll_at = 0.0
@@ -454,7 +407,6 @@ def _begin_async_start_feedback(uploaded_file: Any, user_note: str, mastering_in
             "content_type": content_type,
             "duration_sec": duration_sec,
             "user_note": user_note or "",
-            "mastering_intensity": mastering_intensity,
             "shared": shared,
         },
         daemon=True,
@@ -508,7 +460,7 @@ def _render_live_progress_component(*, started_at: float, estimate_sec: Optional
     st.progress(int(round(progress)))
 
 
-def _init_upload_and_start(uploaded_file: Any, user_note: str, mastering_intensity: str = DEFAULT_MASTERING_INTENSITY) -> None:
+def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
     cfg = _service_config()
     if not cfg["url"]:
         raise ServiceError("서비스 주소가 설정되지 않았습니다.")
@@ -519,7 +471,6 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str, mastering_intensi
     duration_sec = _read_wav_duration_sec(data)
     content_type = uploaded_file.type or "audio/wav"
     started_at = time.time()
-    mastering_intensity = _normalize_mastering_intensity(mastering_intensity)
 
     init_payload = _request_json(
         "POST",
@@ -534,7 +485,6 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str, mastering_intensi
             "content_type": content_type,
             "mode": DEFAULT_MODE,
             "user_note": user_note or "",
-            "mastering_intensity": mastering_intensity,
             "client_build_id": APP_BUILD_ID,
         },
     )
@@ -547,7 +497,6 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str, mastering_intensi
     st.session_state.busy_started_at = started_at
     st.session_state.busy_estimate_sec = _payload_estimate_sec(init_payload)
     st.session_state.busy_original_filename = uploaded_file.name
-    st.session_state.busy_mastering_intensity = mastering_intensity
     st.session_state.busy_download_filename = _download_filename_from_original(uploaded_file.name)
     st.session_state.busy_download_bytes = b""
     st.session_state.busy_last_status_poll_at = 0.0
@@ -561,7 +510,7 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str, mastering_intensi
 
     _upload_to_signed_url(signed_url, data, content_type)
     st.session_state.busy_job_payload.update({"status": "processing", "stage": "mastering", "progress_pct": 20})
-    _launch_start_thread(job_id, user_note, mastering_intensity)
+    _launch_start_thread(job_id, user_note)
 
 
 def _display_job(payload: Dict[str, Any]) -> None:
@@ -699,7 +648,7 @@ def _reset_if_new_upload(uploaded_name: str) -> None:
     if prev and prev != uploaded_name and _job_is_done(st.session_state.get("busy_job_payload") or {}):
         for key in [
             "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
-            "busy_original_filename", "busy_mastering_intensity", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
+            "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
             "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at",
         ]:
             st.session_state.pop(key, None)
@@ -716,20 +665,6 @@ def main() -> None:
 
     uploaded = st.file_uploader("WAV 파일 업로드", type=["wav"], accept_multiple_files=False)
     user_note = st.text_area("장르/스타일 태그(선택)", value="", height=70, placeholder="비워두면 자동으로 처리됩니다.")
-
-    current_payload = st.session_state.get("busy_job_payload") or {}
-    current_active = _job_is_active(current_payload)
-    saved_intensity = _normalize_mastering_intensity(st.session_state.get("busy_mastering_intensity", DEFAULT_MASTERING_INTENSITY))
-    intensity_keys = list(MASTERING_INTENSITY_OPTIONS.keys())
-    mastering_intensity = st.selectbox(
-        "마스터링 강도",
-        options=intensity_keys,
-        index=intensity_keys.index(saved_intensity) if saved_intensity in intensity_keys else intensity_keys.index(DEFAULT_MASTERING_INTENSITY),
-        format_func=_intensity_display,
-        disabled=current_active,
-        help="기준 음압과 허용 가능한 상업용 처리 강도를 선택합니다.",
-    )
-    st.caption(MASTERING_INTENSITY_OPTIONS[_normalize_mastering_intensity(mastering_intensity)]["description"])
 
     if uploaded is not None:
         _reset_if_new_upload(uploaded.name)
@@ -749,7 +684,7 @@ def main() -> None:
 
     if start_clicked and uploaded is not None:
         try:
-            _begin_async_start_feedback(uploaded, user_note, mastering_intensity)
+            _begin_async_start_feedback(uploaded, user_note)
         except ServiceError as exc:
             st.error(str(exc))
         else:
