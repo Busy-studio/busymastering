@@ -693,6 +693,8 @@ def main() -> None:
     user_note = st.text_area("장르/스타일 태그(선택)", height=70, placeholder="비워두면 자동으로 처리됩니다.", key=f"busy_user_note_{note_nonce}")
 
     start_clicked = False
+    payload = st.session_state.get("busy_job_payload") or {}
+    job_id = str(st.session_state.get("busy_job_id") or "")
 
     # The start button is intentionally not rendered on the initial screen.
     # It appears only after a WAV is loaded and the file metadata is displayed.
@@ -726,7 +728,7 @@ def main() -> None:
 
     _sync_bootstrap_state()
     job_id = str(st.session_state.get("busy_job_id") or "")
-    payload = st.session_state.get("busy_job_payload") or payload
+    payload = st.session_state.get("busy_job_payload") or {}
     if job_id or _job_is_active(payload) or _job_is_failed(payload):
         if _job_is_active(payload):
             _live_job_status_panel()
