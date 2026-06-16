@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.11-public-ui-native-progress-20260616"
+APP_BUILD_ID = "v8.5.4.16-public-ui-reset-progress-percent-20260616"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
 
@@ -456,8 +456,10 @@ def _render_live_progress_component(*, started_at: float, estimate_sec: Optional
             progress = max(progress, worker_val)
 
     progress = min(95.0, max(progress, 1.0))
+    pct = int(round(progress))
     st.info(f"{label} [{_fmt(elapsed)}{estimate_text}]")
-    st.progress(int(round(progress)))
+    st.progress(pct)
+    st.caption(f"진행률 {pct}%")
 
 
 def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
@@ -526,11 +528,13 @@ def _display_job(payload: Dict[str, Any]) -> None:
 
     if _job_is_done(payload):
         st.progress(100)
+        st.caption("진행률 100%")
         st.success("마스터링이 완료되었습니다.")
         return
 
     if _job_is_failed(payload):
         st.progress(100)
+        st.caption("진행률 100%")
         st.error("마스터링에 실패했습니다.")
         msg = str(payload.get("message") or payload.get("error_tail") or "")
         if msg:
@@ -593,13 +597,19 @@ def _render_done_download(job_id: str, payload: Dict[str, Any]) -> None:
             st.error(str(exc))
             st.session_state.busy_download_bytes = b""
     if st.session_state.get("busy_download_bytes"):
-        st.download_button(
-            "마스터링 WAV 다운로드",
-            data=st.session_state.busy_download_bytes,
-            file_name=st.session_state.get("busy_download_filename") or "BAM_mastered_48k_24bit.wav",
-            mime="audio/wav",
-            type="primary",
-        )
+        col_download, col_reset = st.columns([3, 1])
+        with col_download:
+            st.download_button(
+                "마스터링 WAV 다운로드",
+                data=st.session_state.busy_download_bytes,
+                file_name=st.session_state.get("busy_download_filename") or "BAM_mastered_48k_24bit.wav",
+                mime="audio/wav",
+                type="primary",
+                use_container_width=True,
+            )
+        with col_reset:
+            if st.button("초기화", type="secondary", use_container_width=True):
+                _reset_app_to_initial()
 
 
 def _render_job_status_panel() -> None:
@@ -643,6 +653,20 @@ def _live_job_status_panel() -> None:
 
 
 
+def _reset_app_to_initial() -> None:
+    """Clear all UI/job state and return to the initial upload screen."""
+    for key in [
+        "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
+        "busy_original_filename", "busy_download_filename", "busy_download_bytes",
+        "busy_start_thread", "busy_start_bootstrap_thread", "busy_async_start_state",
+        "busy_last_status_poll_at", "busy_last_uploaded_name",
+    ]:
+        st.session_state.pop(key, None)
+    st.session_state["busy_uploader_nonce"] = int(st.session_state.get("busy_uploader_nonce", 0) or 0) + 1
+    st.session_state["busy_note_nonce"] = int(st.session_state.get("busy_note_nonce", 0) or 0) + 1
+    st.rerun()
+
+
 def _reset_if_new_upload(uploaded_name: str) -> None:
     prev = st.session_state.get("busy_last_uploaded_name")
     if prev and prev != uploaded_name and _job_is_done(st.session_state.get("busy_job_payload") or {}):
@@ -663,9 +687,12 @@ def main() -> None:
     if not cfg["url"]:
         st.warning("서비스 설정이 필요합니다.")
 
-    uploaded = st.file_uploader("WAV 파일 업로드", type=["wav"], accept_multiple_files=False)
-    user_note = st.text_area("장르/스타일 태그(선택)", value="", height=70, placeholder="비워두면 자동으로 처리됩니다.")
+    uploader_nonce = int(st.session_state.get("busy_uploader_nonce", 0) or 0)
+    note_nonce = int(st.session_state.get("busy_note_nonce", 0) or 0)
+    uploaded = st.file_uploader("WAV 파일 업로드", type=["wav"], accept_multiple_files=False, key=f"busy_wav_uploader_{uploader_nonce}")
+    user_note = st.text_area("장르/스타일 태그(선택)", height=70, placeholder="비워두면 자동으로 처리됩니다.", key=f"busy_user_note_{note_nonce}")
 
+    file_ready = False
     if uploaded is not None:
         _reset_if_new_upload(uploaded.name)
         file_data = uploaded.getvalue()
@@ -674,13 +701,16 @@ def main() -> None:
         cols = st.columns(2)
         cols[0].metric("파일 크기", f"{size_mb:.1f} MB")
         cols[1].metric("곡 길이", _format_duration(duration_sec))
+        file_ready = True
 
     _sync_bootstrap_state()
     job_id = str(st.session_state.get("busy_job_id") or "")
     payload = st.session_state.get("busy_job_payload") or {}
     active = _job_is_active(payload)
-    start_disabled = uploaded is None or not cfg["url"] or active
-    start_clicked = st.button("마스터링 시작", type="primary", disabled=start_disabled)
+    terminal = _job_is_done(payload) or _job_is_failed(payload)
+    start_clicked = False
+    if file_ready and not job_id and not active and not terminal:
+        start_clicked = st.button("마스터링 시작", type="primary", disabled=not cfg["url"], use_container_width=True)
 
     if start_clicked and uploaded is not None:
         try:
