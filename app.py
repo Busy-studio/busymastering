@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.16-public-ui-reset-progress-percent-20260616"
+APP_BUILD_ID = "v8.5.4.17-public-hide-start-until-file-ready-20260616"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
 
@@ -692,7 +692,10 @@ def main() -> None:
     uploaded = st.file_uploader("WAV 파일 업로드", type=["wav"], accept_multiple_files=False, key=f"busy_wav_uploader_{uploader_nonce}")
     user_note = st.text_area("장르/스타일 태그(선택)", height=70, placeholder="비워두면 자동으로 처리됩니다.", key=f"busy_user_note_{note_nonce}")
 
-    file_ready = False
+    start_clicked = False
+
+    # The start button is intentionally not rendered on the initial screen.
+    # It appears only after a WAV is loaded and the file metadata is displayed.
     if uploaded is not None:
         _reset_if_new_upload(uploaded.name)
         file_data = uploaded.getvalue()
@@ -701,16 +704,17 @@ def main() -> None:
         cols = st.columns(2)
         cols[0].metric("파일 크기", f"{size_mb:.1f} MB")
         cols[1].metric("곡 길이", _format_duration(duration_sec))
-        file_ready = True
 
-    _sync_bootstrap_state()
-    job_id = str(st.session_state.get("busy_job_id") or "")
-    payload = st.session_state.get("busy_job_payload") or {}
-    active = _job_is_active(payload)
-    terminal = _job_is_done(payload) or _job_is_failed(payload)
-    start_clicked = False
-    if file_ready and not job_id and not active and not terminal:
-        start_clicked = st.button("마스터링 시작", type="primary", disabled=not cfg["url"], use_container_width=True)
+        _sync_bootstrap_state()
+        job_id = str(st.session_state.get("busy_job_id") or "")
+        payload = st.session_state.get("busy_job_payload") or {}
+        active = _job_is_active(payload)
+        terminal = _job_is_done(payload) or _job_is_failed(payload)
+        if not job_id and not active and not terminal:
+            if cfg["url"]:
+                start_clicked = st.button("마스터링 시작", type="primary", use_container_width=True)
+            else:
+                st.warning("서비스 설정이 필요합니다.")
 
     if start_clicked and uploaded is not None:
         try:
