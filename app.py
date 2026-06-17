@@ -3,17 +3,20 @@ from __future__ import annotations
 import math
 import re
 import threading
+import unicodedata
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from typing import Any, Dict, Optional
 
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.17-public-hide-start-until-file-ready-20260616"
+APP_BUILD_ID = "v8.5.4.19-public-multifile-stem-zip-unicode-download-20260617"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
+MAX_STEM_ZIP_MB = 500
 
 
 class ServiceError(RuntimeError):
@@ -169,14 +172,50 @@ def _payload_estimate_sec(payload: Dict[str, Any]) -> Optional[float]:
 
 
 def _download_filename_from_original(name: str) -> str:
-    base = str(name or "BAM_mastered.wav").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    base = str(name or "BAM.wav").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    base = unicodedata.normalize("NFC", base)
     if "." in base:
         stem = ".".join(base.split(".")[:-1]) or base
     else:
         stem = base
-    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem).strip(" ._") or "mastered"
-    return f"{stem}_BAM_mastered_48k_24bit.wav"
+    # Keep Unicode letters from Korean/English/other languages.  Only replace
+    # filesystem-invalid characters and invisible control chars.
+    stem = re.sub(r'[\\/:*?"<>|]+', "_", stem)
+    stem = re.sub(r"[\x00-\x1f\x7f]+", "_", stem)
+    stem = stem.strip(" ._") or "mastered"
+    return f"{stem}_BAM_48k_24bit.wav"
 
+
+
+def _is_zip_upload(uploaded: Any) -> bool:
+    name = str(getattr(uploaded, "name", "") or "").lower()
+    return name.endswith(".zip")
+
+
+def _is_wav_upload(uploaded: Any) -> bool:
+    name = str(getattr(uploaded, "name", "") or "").lower()
+    return name.endswith(".wav")
+
+
+def _split_upload_selection(uploaded_files: Any) -> tuple[Optional[Any], Optional[Any], str]:
+    files = list(uploaded_files or [])
+    wavs = [f for f in files if _is_wav_upload(f)]
+    zips = [f for f in files if _is_zip_upload(f)]
+    others = [f for f in files if not _is_wav_upload(f) and not _is_zip_upload(f)]
+    if others:
+        return None, None, "WAV 파일과 ZIP 파일만 업로드할 수 있습니다."
+    if not wavs:
+        return None, zips[0] if zips else None, "완성본 WAV 파일을 1개 업로드해 주세요."
+    if len(wavs) > 1:
+        return None, zips[0] if zips else None, "완성본 WAV는 1개만 업로드해 주세요. 분리 트랙은 ZIP으로 올려주세요."
+    if len(zips) > 1:
+        return wavs[0], None, "분리트랙 ZIP은 1개만 업로드해 주세요."
+    return wavs[0], zips[0] if zips else None, ""
+
+
+def _upload_selection_key(uploaded_files: Any) -> str:
+    files = list(uploaded_files or [])
+    return "|".join(f"{getattr(f, 'name', '')}:{getattr(f, 'size', '')}" for f in files)
 
 def _job_is_done(payload: Dict[str, Any]) -> bool:
     return str(payload.get("status", "")).lower() in {"done", "completed", "success"}
@@ -263,6 +302,9 @@ def _start_job_bootstrap_worker(
     duration_sec: Optional[float],
     user_note: str,
     shared: Dict[str, Any],
+    stem_zip_data: bytes = b"",
+    stem_zip_filename: str = "",
+    stem_zip_content_type: str = "application/zip",
 ) -> None:
     """Runs the slow init/upload/start path off the Streamlit render thread.
 
@@ -286,15 +328,21 @@ def _start_job_bootstrap_worker(
                 "size_bytes": len(data),
                 "audio_duration_sec": duration_sec,
                 "content_type": content_type,
+                "stem_zip_filename": stem_zip_filename or "",
+                "stem_zip_size_bytes": len(stem_zip_data or b""),
+                "stem_zip_content_type": stem_zip_content_type or "application/zip",
                 "mode": DEFAULT_MODE,
                 "user_note": user_note or "",
                 "client_build_id": APP_BUILD_ID,
             },
         )
         signed_url = str(init_payload.get("signed_upload_url") or "")
+        stem_signed_url = str(init_payload.get("signed_stem_zip_upload_url") or "")
         job_id = str(init_payload.get("job_id") or "")
         if not signed_url or not job_id:
             raise ServiceError("업로드 준비 응답이 올바르지 않습니다.")
+        if stem_zip_data and not stem_signed_url:
+            raise ServiceError("분리트랙 ZIP 업로드 준비 응답이 올바르지 않습니다.")
 
         payload = {
             **init_payload,
@@ -311,7 +359,14 @@ def _start_job_bootstrap_worker(
             "payload": payload,
         })
 
-        _upload_to_signed_url(signed_url, data, content_type)
+        if stem_zip_data and stem_signed_url:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fut_main = ex.submit(_upload_to_signed_url, signed_url, data, content_type)
+                fut_zip = ex.submit(_upload_to_signed_url, stem_signed_url, stem_zip_data, stem_zip_content_type or "application/zip")
+                fut_main.result()
+                fut_zip.result()
+        else:
+            _upload_to_signed_url(signed_url, data, content_type)
         payload = {
             **init_payload,
             "job_id": job_id,
@@ -367,14 +422,24 @@ def _sync_bootstrap_state() -> None:
         st.session_state.busy_job_payload = dict(shared.get("payload") or _async_payload("failed", "start_failed", 100, str(shared.get("error") or "")))
 
 
-def _begin_async_start_feedback(uploaded_file: Any, user_note: str) -> None:
+def _begin_async_start_feedback(uploaded_file: Any, stem_zip_file: Optional[Any], user_note: str) -> None:
     cfg = _service_config()
     if not cfg["url"]:
         raise ServiceError("서비스 주소가 설정되지 않았습니다.")
     data = uploaded_file.getvalue()
     size_mb = len(data) / (1024 * 1024)
     if size_mb > MAX_UPLOAD_MB:
-        raise ServiceError(f"파일이 너무 큽니다: {size_mb:.1f} MB / 제한 {MAX_UPLOAD_MB} MB")
+        raise ServiceError(f"완성본 WAV 파일이 너무 큽니다: {size_mb:.1f} MB / 제한 {MAX_UPLOAD_MB} MB")
+    stem_zip_data = b""
+    stem_zip_filename = ""
+    stem_zip_content_type = "application/zip"
+    if stem_zip_file is not None:
+        stem_zip_data = stem_zip_file.getvalue()
+        zip_mb = len(stem_zip_data) / (1024 * 1024)
+        if zip_mb > MAX_STEM_ZIP_MB:
+            raise ServiceError(f"분리트랙 ZIP 파일이 너무 큽니다: {zip_mb:.1f} MB / 제한 {MAX_STEM_ZIP_MB} MB")
+        stem_zip_filename = str(stem_zip_file.name or "separated_tracks.zip")
+        stem_zip_content_type = stem_zip_file.type or "application/zip"
     duration_sec = _read_wav_duration_sec(data)
     content_type = uploaded_file.type or "audio/wav"
     filename = str(uploaded_file.name or "upload.wav")
@@ -393,6 +458,8 @@ def _begin_async_start_feedback(uploaded_file: Any, user_note: str) -> None:
     st.session_state.busy_started_at = started_at
     st.session_state.busy_estimate_sec = None
     st.session_state.busy_original_filename = filename
+    st.session_state.busy_stem_zip_filename = stem_zip_filename
+    st.session_state.busy_stem_zip_provided = bool(stem_zip_data)
     st.session_state.busy_download_filename = _download_filename_from_original(filename)
     st.session_state.busy_download_bytes = b""
     st.session_state.busy_last_status_poll_at = 0.0
@@ -408,6 +475,9 @@ def _begin_async_start_feedback(uploaded_file: Any, user_note: str) -> None:
             "duration_sec": duration_sec,
             "user_note": user_note or "",
             "shared": shared,
+            "stem_zip_data": stem_zip_data,
+            "stem_zip_filename": stem_zip_filename,
+            "stem_zip_content_type": stem_zip_content_type,
         },
         daemon=True,
     )
@@ -602,7 +672,7 @@ def _render_done_download(job_id: str, payload: Dict[str, Any]) -> None:
             st.download_button(
                 "마스터링 WAV 다운로드",
                 data=st.session_state.busy_download_bytes,
-                file_name=st.session_state.get("busy_download_filename") or "BAM_mastered_48k_24bit.wav",
+                file_name=st.session_state.get("busy_download_filename") or "BAM_48k_24bit.wav",
                 mime="audio/wav",
                 type="primary",
                 use_container_width=True,
@@ -659,7 +729,7 @@ def _reset_app_to_initial() -> None:
         "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
         "busy_original_filename", "busy_download_filename", "busy_download_bytes",
         "busy_start_thread", "busy_start_bootstrap_thread", "busy_async_start_state",
-        "busy_last_status_poll_at", "busy_last_uploaded_name",
+        "busy_last_status_poll_at", "busy_last_uploaded_name", "busy_stem_zip_filename", "busy_stem_zip_provided",
     ]:
         st.session_state.pop(key, None)
     st.session_state["busy_uploader_nonce"] = int(st.session_state.get("busy_uploader_nonce", 0) or 0) + 1
@@ -673,7 +743,7 @@ def _reset_if_new_upload(uploaded_name: str) -> None:
         for key in [
             "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
             "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
-            "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at",
+            "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at", "busy_stem_zip_filename", "busy_stem_zip_provided",
         ]:
             st.session_state.pop(key, None)
     st.session_state.busy_last_uploaded_name = uploaded_name
@@ -689,7 +759,8 @@ def main() -> None:
 
     uploader_nonce = int(st.session_state.get("busy_uploader_nonce", 0) or 0)
     note_nonce = int(st.session_state.get("busy_note_nonce", 0) or 0)
-    uploaded = st.file_uploader("WAV 파일 업로드", type=["wav"], accept_multiple_files=False, key=f"busy_wav_uploader_{uploader_nonce}")
+    uploaded_files = st.file_uploader("파일 업로드", type=["wav", "zip"], accept_multiple_files=True, key=f"busy_file_uploader_{uploader_nonce}")
+    uploaded, stem_zip, upload_error = _split_upload_selection(uploaded_files)
     user_note = st.text_area("장르/스타일 태그(선택)", height=70, placeholder="비워두면 자동으로 처리됩니다.", key=f"busy_user_note_{note_nonce}")
 
     start_clicked = False
@@ -697,15 +768,23 @@ def main() -> None:
     job_id = str(st.session_state.get("busy_job_id") or "")
 
     # The start button is intentionally not rendered on the initial screen.
-    # It appears only after a WAV is loaded and the file metadata is displayed.
+    # It appears only after a valid main WAV is loaded and the file metadata is displayed.
+    if upload_error and uploaded_files:
+        st.warning(upload_error)
     if uploaded is not None:
-        _reset_if_new_upload(uploaded.name)
+        _reset_if_new_upload(_upload_selection_key(uploaded_files))
         file_data = uploaded.getvalue()
         size_mb = len(file_data) / (1024 * 1024)
         duration_sec = _read_wav_duration_sec(file_data)
-        cols = st.columns(2)
-        cols[0].metric("파일 크기", f"{size_mb:.1f} MB")
-        cols[1].metric("곡 길이", _format_duration(duration_sec))
+        cols = st.columns(3)
+        cols[0].metric("완성본 파일", uploaded.name)
+        cols[1].metric("파일 크기", f"{size_mb:.1f} MB")
+        cols[2].metric("곡 길이", _format_duration(duration_sec))
+        if stem_zip is not None:
+            zip_size_mb = len(stem_zip.getvalue()) / (1024 * 1024)
+            st.caption(f"분리트랙 ZIP 감지: {stem_zip.name} ({zip_size_mb:.1f} MB) · 선택사항으로 분석에 활용됩니다.")
+        else:
+            st.caption("분리트랙 ZIP 없이 기존 방식으로 진행됩니다.")
 
         _sync_bootstrap_state()
         job_id = str(st.session_state.get("busy_job_id") or "")
@@ -720,7 +799,7 @@ def main() -> None:
 
     if start_clicked and uploaded is not None:
         try:
-            _begin_async_start_feedback(uploaded, user_note)
+            _begin_async_start_feedback(uploaded, stem_zip, user_note)
         except ServiceError as exc:
             st.error(str(exc))
         else:
