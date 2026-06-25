@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.19-public-multifile-stem-zip-unicode-download-20260617"
+APP_BUILD_ID = "v8.5.4.20.1-public-busy-auto-mixing-start-error-hotfix-20260625"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_UPLOAD_MB = 250
 MAX_STEM_ZIP_MB = 500
@@ -253,7 +253,7 @@ def _status_poll_due() -> bool:
     return True
 
 
-def _start_worker_request_with_cfg(cfg: Dict[str, str], job_id: str, user_note: str) -> None:
+def _start_worker_request_with_cfg(cfg: Dict[str, str], job_id: str, user_note: str, busy_auto_mixing: bool = False, *, suppress_errors: bool = True) -> None:
     try:
         _request_json(
             "POST",
@@ -261,23 +261,27 @@ def _start_worker_request_with_cfg(cfg: Dict[str, str], job_id: str, user_note: 
             cfg["token"],
             float(cfg["start_timeout"] or 3600),
             retries=3,
-            json={"mode": DEFAULT_MODE, "user_note": user_note or ""},
+            json={"mode": DEFAULT_MODE, "user_note": user_note or "", "busy_auto_mixing": bool(busy_auto_mixing)},
         )
     except Exception:
-        # The UI polls persisted job state, so the thread should not crash Streamlit.
-        pass
+        # Background polling can tolerate a swallowed exception, but the initial
+        # bootstrap path must surface /start errors such as missing stem ZIP handoff.
+        if suppress_errors:
+            pass
+        else:
+            raise
 
 
-def _start_worker_request(job_id: str, user_note: str) -> None:
+def _start_worker_request(job_id: str, user_note: str, busy_auto_mixing: bool = False) -> None:
     cfg = _service_config()
-    _start_worker_request_with_cfg(cfg, job_id, user_note)
+    _start_worker_request_with_cfg(cfg, job_id, user_note, busy_auto_mixing)
 
 
-def _launch_start_thread(job_id: str, user_note: str) -> None:
+def _launch_start_thread(job_id: str, user_note: str, busy_auto_mixing: bool = False) -> None:
     current = st.session_state.get("busy_start_thread")
     if current is not None and getattr(current, "is_alive", lambda: False)():
         return
-    thread = threading.Thread(target=_start_worker_request, args=(job_id, user_note or ""), daemon=True)
+    thread = threading.Thread(target=_start_worker_request, args=(job_id, user_note or "", bool(busy_auto_mixing)), daemon=True)
     st.session_state.busy_start_thread = thread
     thread.start()
 
@@ -305,6 +309,7 @@ def _start_job_bootstrap_worker(
     stem_zip_data: bytes = b"",
     stem_zip_filename: str = "",
     stem_zip_content_type: str = "application/zip",
+    busy_auto_mixing: bool = False,
 ) -> None:
     """Runs the slow init/upload/start path off the Streamlit render thread.
 
@@ -331,6 +336,7 @@ def _start_job_bootstrap_worker(
                 "stem_zip_filename": stem_zip_filename or "",
                 "stem_zip_size_bytes": len(stem_zip_data or b""),
                 "stem_zip_content_type": stem_zip_content_type or "application/zip",
+                "busy_auto_mixing": bool(busy_auto_mixing),
                 "mode": DEFAULT_MODE,
                 "user_note": user_note or "",
                 "client_build_id": APP_BUILD_ID,
@@ -371,12 +377,12 @@ def _start_job_bootstrap_worker(
             **init_payload,
             "job_id": job_id,
             "status": "processing",
-            "stage": "mastering",
+            "stage": "busy_auto_mixing" if busy_auto_mixing else "mastering",
             "progress_pct": 20,
-            "message": "마스터링 중",
+            "message": "오토 믹싱 및 마스터링 중" if busy_auto_mixing else "마스터링 중",
         }
         shared.update({"phase": "processing", "payload": payload})
-        _start_worker_request_with_cfg(cfg, job_id, user_note)
+        _start_worker_request_with_cfg(cfg, job_id, user_note, busy_auto_mixing, suppress_errors=False)
         shared.update({"phase": "started", "payload": payload, "done": True})
     except Exception as exc:
         shared.update({
@@ -422,10 +428,12 @@ def _sync_bootstrap_state() -> None:
         st.session_state.busy_job_payload = dict(shared.get("payload") or _async_payload("failed", "start_failed", 100, str(shared.get("error") or "")))
 
 
-def _begin_async_start_feedback(uploaded_file: Any, stem_zip_file: Optional[Any], user_note: str) -> None:
+def _begin_async_start_feedback(uploaded_file: Any, stem_zip_file: Optional[Any], user_note: str, busy_auto_mixing: bool = False) -> None:
     cfg = _service_config()
     if not cfg["url"]:
         raise ServiceError("서비스 주소가 설정되지 않았습니다.")
+    if busy_auto_mixing and stem_zip_file is None:
+        raise ServiceError("Busy Auto Mixing을 사용하려면 분리트랙 ZIP 파일이 필요합니다.")
     data = uploaded_file.getvalue()
     size_mb = len(data) / (1024 * 1024)
     if size_mb > MAX_UPLOAD_MB:
@@ -460,6 +468,7 @@ def _begin_async_start_feedback(uploaded_file: Any, stem_zip_file: Optional[Any]
     st.session_state.busy_original_filename = filename
     st.session_state.busy_stem_zip_filename = stem_zip_filename
     st.session_state.busy_stem_zip_provided = bool(stem_zip_data)
+    st.session_state.busy_auto_mixing_enabled = bool(busy_auto_mixing and stem_zip_data)
     st.session_state.busy_download_filename = _download_filename_from_original(filename)
     st.session_state.busy_download_bytes = b""
     st.session_state.busy_last_status_poll_at = 0.0
@@ -478,6 +487,7 @@ def _begin_async_start_feedback(uploaded_file: Any, stem_zip_file: Optional[Any]
             "stem_zip_data": stem_zip_data,
             "stem_zip_filename": stem_zip_filename,
             "stem_zip_content_type": stem_zip_content_type,
+            "busy_auto_mixing": bool(busy_auto_mixing and stem_zip_data),
         },
         daemon=True,
     )
@@ -532,7 +542,7 @@ def _render_live_progress_component(*, started_at: float, estimate_sec: Optional
     st.caption(f"진행률 {pct}%")
 
 
-def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
+def _init_upload_and_start(uploaded_file: Any, user_note: str, busy_auto_mixing: bool = False) -> None:
     cfg = _service_config()
     if not cfg["url"]:
         raise ServiceError("서비스 주소가 설정되지 않았습니다.")
@@ -558,6 +568,7 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
             "mode": DEFAULT_MODE,
             "user_note": user_note or "",
             "client_build_id": APP_BUILD_ID,
+            "busy_auto_mixing": bool(busy_auto_mixing),
         },
     )
     signed_url = str(init_payload.get("signed_upload_url") or "")
@@ -582,7 +593,7 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str) -> None:
 
     _upload_to_signed_url(signed_url, data, content_type)
     st.session_state.busy_job_payload.update({"status": "processing", "stage": "mastering", "progress_pct": 20})
-    _launch_start_thread(job_id, user_note)
+    _launch_start_thread(job_id, user_note, busy_auto_mixing)
 
 
 def _display_job(payload: Dict[str, Any]) -> None:
@@ -626,8 +637,12 @@ def _display_job(payload: Dict[str, Any]) -> None:
     elif status == "uploading" or stage == "uploading":
         label = "파일 업로드 중"
         min_progress = 10.0
+    elif stage in {"busy_auto_mixing", "auto_mixing", "bamix"}:
+        label = "오토 믹싱 및 마스터링 중"
+        min_progress = 20.0
     else:
-        label = "마스터링 중"
+        bamix = payload.get("busy_auto_mixing") if isinstance(payload.get("busy_auto_mixing"), dict) else {}
+        label = "오토 믹싱 및 마스터링 중" if bamix.get("requested") or bamix.get("requested_at_init") else "마스터링 중"
         min_progress = 20.0
     _render_live_progress_component(
         started_at=started_at,
@@ -729,7 +744,7 @@ def _reset_app_to_initial() -> None:
         "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
         "busy_original_filename", "busy_download_filename", "busy_download_bytes",
         "busy_start_thread", "busy_start_bootstrap_thread", "busy_async_start_state",
-        "busy_last_status_poll_at", "busy_last_uploaded_name", "busy_stem_zip_filename", "busy_stem_zip_provided",
+        "busy_last_status_poll_at", "busy_last_uploaded_name", "busy_stem_zip_filename", "busy_stem_zip_provided", "busy_auto_mixing_enabled", "busy_auto_mixing_checkbox",
     ]:
         st.session_state.pop(key, None)
     st.session_state["busy_uploader_nonce"] = int(st.session_state.get("busy_uploader_nonce", 0) or 0) + 1
@@ -743,7 +758,7 @@ def _reset_if_new_upload(uploaded_name: str) -> None:
         for key in [
             "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
             "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
-            "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at", "busy_stem_zip_filename", "busy_stem_zip_provided",
+            "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at", "busy_stem_zip_filename", "busy_stem_zip_provided", "busy_auto_mixing_enabled", "busy_auto_mixing_checkbox",
         ]:
             st.session_state.pop(key, None)
     st.session_state.busy_last_uploaded_name = uploaded_name
@@ -780,9 +795,23 @@ def main() -> None:
         cols[0].metric("완성본 파일", uploaded.name)
         cols[1].metric("파일 크기", f"{size_mb:.1f} MB")
         cols[2].metric("곡 길이", _format_duration(duration_sec))
+        busy_auto_mixing_enabled = False
         if stem_zip is not None:
             zip_size_mb = len(stem_zip.getvalue()) / (1024 * 1024)
-            st.caption(f"분리트랙 ZIP 감지: {stem_zip.name} ({zip_size_mb:.1f} MB) · 선택사항으로 분석에 활용됩니다.")
+            st.caption(f"분리트랙 ZIP 감지: {stem_zip.name} ({zip_size_mb:.1f} MB)")
+            busy_auto_mixing_enabled = st.checkbox(
+                "Busy Auto Mixing 사용",
+                value=False,
+                key="busy_auto_mixing_checkbox",
+                help=(
+                    "선택하면 업로드한 분리트랙 ZIP으로 자동 믹싱 premaster를 먼저 만든 뒤 "
+                    "그 premaster를 마스터링합니다. 선택하지 않으면 기존 완성본 WAV 기준으로 마스터링합니다."
+                ),
+            )
+            if busy_auto_mixing_enabled:
+                st.caption("Busy Auto Mixing: 분리트랙으로 자동 믹싱 premaster를 생성한 뒤 마스터링합니다.")
+            else:
+                st.caption("Busy Auto Mixing 미사용: 분리트랙 ZIP은 보조 데이터로만 전달되고 기존 완성본 WAV 기준으로 진행됩니다.")
         else:
             st.caption("분리트랙 ZIP 없이 기존 방식으로 진행됩니다.")
 
@@ -793,13 +822,14 @@ def main() -> None:
         terminal = _job_is_done(payload) or _job_is_failed(payload)
         if not job_id and not active and not terminal:
             if cfg["url"]:
-                start_clicked = st.button("마스터링 시작", type="primary", use_container_width=True)
+                start_label = "오토 믹싱 + 마스터링 시작" if busy_auto_mixing_enabled else "마스터링 시작"
+                start_clicked = st.button(start_label, type="primary", use_container_width=True)
             else:
                 st.warning("서비스 설정이 필요합니다.")
 
     if start_clicked and uploaded is not None:
         try:
-            _begin_async_start_feedback(uploaded, stem_zip, user_note)
+            _begin_async_start_feedback(uploaded, stem_zip, user_note, busy_auto_mixing_enabled)
         except ServiceError as exc:
             st.error(str(exc))
         else:
