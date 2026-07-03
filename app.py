@@ -20,7 +20,10 @@ MAX_STEM_ZIP_MB = 500
 
 
 class ServiceError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: Optional[int] = None, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 def _secret(name: str, default: str = "") -> str:
@@ -62,6 +65,10 @@ def _poll_interval_sec() -> float:
     return max(2.0, min(20.0, _safe_float(cfg.get("poll_interval"), 5.0)))
 
 
+def _status_backoff_max_sec() -> float:
+    return max(5.0, min(120.0, _safe_float(_secret("SERVICE_STATUS_POLL_BACKOFF_MAX_SEC", "45.0"), 45.0)))
+
+
 def _headers(token: str) -> Dict[str, str]:
     headers = {"X-Client-Build": APP_BUILD_ID}
     if token:
@@ -85,6 +92,18 @@ def _friendly_http_error(status_code: int, body: str = "") -> str:
     return f"서비스 오류가 발생했습니다. HTTP {status_code}: {body[:500]}"
 
 
+def _retry_after_sec(value: Any) -> Optional[float]:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        parsed = float(str(value).strip())
+        if math.isfinite(parsed) and parsed > 0:
+            return max(1.0, min(120.0, parsed))
+    except Exception:
+        return None
+    return None
+
+
 def _request_json(method: str, url: str, token: str, timeout: float, *, retries: int = 1, **kwargs: Any) -> Dict[str, Any]:
     last_error = ""
     for attempt in range(max(1, retries + 1)):
@@ -104,15 +123,12 @@ def _request_json(method: str, url: str, token: str, timeout: float, *, retries:
             if not isinstance(payload, dict):
                 raise ServiceError("서비스 응답 형식이 올바르지 않습니다.")
             return payload
+        retry_after = _retry_after_sec(resp.headers.get("Retry-After", ""))
         if resp.status_code == 429 and attempt < retries:
-            retry_after = resp.headers.get("Retry-After", "")
-            try:
-                wait_sec = min(10.0, max(1.5, float(retry_after))) if retry_after else min(10.0, 2.0 + attempt)
-            except Exception:
-                wait_sec = min(10.0, 2.0 + attempt)
+            wait_sec = retry_after if retry_after is not None else min(10.0, 2.0 + attempt)
             time.sleep(wait_sec)
             continue
-        raise ServiceError(_friendly_http_error(resp.status_code, resp.text or ""))
+        raise ServiceError(_friendly_http_error(resp.status_code, resp.text or ""), status_code=resp.status_code, retry_after=retry_after)
     raise ServiceError(last_error or "서비스 요청에 실패했습니다.")
 
 
@@ -239,17 +255,47 @@ def _poll_job(job_id: str, *, timeout_sec: Optional[float] = None) -> Optional[D
         return None
     timeout = _safe_float(timeout_sec, _poll_timeout_sec()) if timeout_sec is not None else _poll_timeout_sec()
     try:
-        return _request_json("GET", _api_url(cfg["url"], f"/v1/jobs/{job_id}"), cfg["token"], timeout, retries=0)
-    except ServiceError:
+        payload = _request_json("GET", _api_url(cfg["url"], f"/v1/jobs/{job_id}"), cfg["token"], timeout, retries=0)
+        st.session_state.busy_status_poll_error_count = 0
+        st.session_state.busy_status_poll_backoff_until = 0.0
+        st.session_state.busy_status_poll_last_error = ""
+        return payload
+    except ServiceError as exc:
+        count = int(st.session_state.get("busy_status_poll_error_count") or 0) + 1
+        st.session_state.busy_status_poll_error_count = count
+        if exc.status_code == 429:
+            wait_sec = exc.retry_after if exc.retry_after is not None else min(_status_backoff_max_sec(), max(_poll_interval_sec(), 3.0) * min(4.0, 1.0 + count * 0.5))
+            st.session_state.busy_status_poll_backoff_until = max(
+                float(st.session_state.get("busy_status_poll_backoff_until") or 0.0),
+                time.time() + wait_sec,
+            )
+            st.session_state.busy_status_poll_last_error = "rate_limited"
+            st.session_state.busy_status_poll_retry_after_sec = wait_sec
+        elif count >= 2:
+            wait_sec = min(_status_backoff_max_sec(), _poll_interval_sec() + count)
+            st.session_state.busy_status_poll_backoff_until = max(
+                float(st.session_state.get("busy_status_poll_backoff_until") or 0.0),
+                time.time() + wait_sec,
+            )
+            st.session_state.busy_status_poll_last_error = "temporary_poll_error"
         return None
 
 
 def _status_poll_due() -> bool:
     now = time.time()
+    backoff_until = _safe_float(st.session_state.get("busy_status_poll_backoff_until"), 0.0)
+    if now < backoff_until:
+        return False
+    job_id = str(st.session_state.get("busy_job_id") or "")
+    last_job_id = str(st.session_state.get("busy_last_status_poll_job_id") or "")
+    if job_id and last_job_id and job_id != last_job_id:
+        st.session_state.busy_status_poll_error_count = 0
+        st.session_state.busy_status_poll_backoff_until = 0.0
     last = _safe_float(st.session_state.get("busy_last_status_poll_at"), 0.0)
     if now - last < _poll_interval_sec():
         return False
     st.session_state.busy_last_status_poll_at = now
+    st.session_state.busy_last_status_poll_job_id = job_id
     return True
 
 
@@ -472,6 +518,10 @@ def _begin_async_start_feedback(uploaded_file: Any, stem_zip_file: Optional[Any]
     st.session_state.busy_download_filename = _download_filename_from_original(filename)
     st.session_state.busy_download_bytes = b""
     st.session_state.busy_last_status_poll_at = 0.0
+    st.session_state.busy_last_status_poll_job_id = ""
+    st.session_state.busy_status_poll_backoff_until = 0.0
+    st.session_state.busy_status_poll_error_count = 0
+    st.session_state.busy_status_poll_last_error = ""
     st.session_state.busy_job_payload = dict(shared["payload"])
 
     thread = threading.Thread(
@@ -583,6 +633,10 @@ def _init_upload_and_start(uploaded_file: Any, user_note: str, busy_auto_mixing:
     st.session_state.busy_download_filename = _download_filename_from_original(uploaded_file.name)
     st.session_state.busy_download_bytes = b""
     st.session_state.busy_last_status_poll_at = 0.0
+    st.session_state.busy_last_status_poll_job_id = ""
+    st.session_state.busy_status_poll_backoff_until = 0.0
+    st.session_state.busy_status_poll_error_count = 0
+    st.session_state.busy_status_poll_last_error = ""
     st.session_state.busy_job_payload = {
         **init_payload,
         "job_id": job_id,
@@ -744,7 +798,9 @@ def _reset_app_to_initial() -> None:
         "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
         "busy_original_filename", "busy_download_filename", "busy_download_bytes",
         "busy_start_thread", "busy_start_bootstrap_thread", "busy_async_start_state",
-        "busy_last_status_poll_at", "busy_last_uploaded_name", "busy_stem_zip_filename", "busy_stem_zip_provided", "busy_auto_mixing_enabled", "busy_auto_mixing_checkbox",
+        "busy_last_status_poll_at", "busy_last_status_poll_job_id", "busy_status_poll_backoff_until",
+        "busy_status_poll_error_count", "busy_status_poll_last_error", "busy_status_poll_retry_after_sec",
+        "busy_last_uploaded_name", "busy_stem_zip_filename", "busy_stem_zip_provided", "busy_auto_mixing_enabled", "busy_auto_mixing_checkbox",
     ]:
         st.session_state.pop(key, None)
     st.session_state["busy_uploader_nonce"] = int(st.session_state.get("busy_uploader_nonce", 0) or 0) + 1
@@ -758,7 +814,10 @@ def _reset_if_new_upload(uploaded_name: str) -> None:
         for key in [
             "busy_job_id", "busy_job_payload", "busy_started_at", "busy_estimate_sec",
             "busy_original_filename", "busy_download_filename", "busy_download_bytes", "busy_start_thread",
-            "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at", "busy_stem_zip_filename", "busy_stem_zip_provided", "busy_auto_mixing_enabled", "busy_auto_mixing_checkbox",
+            "busy_start_bootstrap_thread", "busy_async_start_state", "busy_last_status_poll_at",
+            "busy_last_status_poll_job_id", "busy_status_poll_backoff_until", "busy_status_poll_error_count",
+            "busy_status_poll_last_error", "busy_status_poll_retry_after_sec",
+            "busy_stem_zip_filename", "busy_stem_zip_provided", "busy_auto_mixing_enabled", "busy_auto_mixing_checkbox",
         ]:
             st.session_state.pop(key, None)
     st.session_state.busy_last_uploaded_name = uploaded_name
