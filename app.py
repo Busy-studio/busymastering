@@ -835,7 +835,6 @@ def main() -> None:
     uploader_nonce = int(st.session_state.get("busy_uploader_nonce", 0) or 0)
     note_nonce = int(st.session_state.get("busy_note_nonce", 0) or 0)
     uploaded_files = st.file_uploader("파일 업로드", type=["wav", "zip"], accept_multiple_files=True, key=f"busy_file_uploader_{uploader_nonce}")
-    st.caption(f"WAV/ZIP 파일은 각각 최대 {MAX_FILE_UPLOAD_MB} MB까지 업로드할 수 있습니다.")
     uploaded, stem_zip, upload_error = _split_upload_selection(uploaded_files)
     user_note = st.text_area("장르/스타일 태그(선택)", height=70, placeholder="비워두면 자동으로 처리됩니다.", key=f"busy_user_note_{note_nonce}")
 
