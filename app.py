@@ -15,8 +15,9 @@ import streamlit as st
 
 APP_BUILD_ID = "v8.5.4.20.1-public-busy-auto-mixing-start-error-hotfix-20260625"
 DEFAULT_MODE = "Auto Commercial Master"
-MAX_UPLOAD_MB = 250
-MAX_STEM_ZIP_MB = 500
+MAX_FILE_UPLOAD_MB = 500
+MAX_UPLOAD_MB = MAX_FILE_UPLOAD_MB
+MAX_STEM_ZIP_MB = MAX_FILE_UPLOAD_MB
 
 
 class ServiceError(RuntimeError):
