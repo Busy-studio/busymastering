@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 import requests
 import streamlit as st
 
-APP_BUILD_ID = "v8.5.4.20.1-public-busy-auto-mixing-start-error-hotfix-20260625"
+APP_BUILD_ID = "v8.5.4.20.2-public-download-ready-status-fallback-20260707"
 DEFAULT_MODE = "Auto Commercial Master"
 MAX_FILE_UPLOAD_MB = 500
 MAX_UPLOAD_MB = MAX_FILE_UPLOAD_MB
@@ -234,12 +234,98 @@ def _upload_selection_key(uploaded_files: Any) -> str:
     files = list(uploaded_files or [])
     return "|".join(f"{getattr(f, 'name', '')}:{getattr(f, 'size', '')}" for f in files)
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "done", "ready", "completed", "success"}
+
+
+def _first_payload_value(payload: Dict[str, Any], *paths: str) -> Any:
+    for path in paths:
+        cur: Any = payload
+        ok = True
+        for part in path.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur.get(part)
+            else:
+                ok = False
+                break
+        if ok and cur not in (None, ""):
+            return cur
+    return None
+
+
+def _payload_has_download_pointer(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    value = _first_payload_value(
+        payload,
+        "download_url",
+        "signed_download_url",
+        "output_path",
+        "final_output_path",
+        "supabase_output_path",
+        "output_supabase_path",
+        "output_storage_path",
+        "result_path",
+        "result.output_path",
+        "result.final_output_path",
+        "result.supabase_output_path",
+        "analysis_report.output_path",
+        "analysis_report.final_output_path",
+        "analysis_report.supabase_output_path",
+        "stage_state.output_path",
+        "stage_state.final_output_path",
+        "stage_state.supabase_output_path",
+        "debug_brief.output_path",
+    )
+    return bool(value)
+
+
+def _payload_has_finished_artifact(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if _truthy(_first_payload_value(payload, "download_ready", "result.download_ready", "stage_state.download_ready")):
+        return True
+    export_accepted = _truthy(_first_payload_value(
+        payload,
+        "final_export_lock.accepted",
+        "analysis_report.final_export_lock.accepted",
+        "stage_state.final_export_lock.accepted",
+    ))
+    stage_done = bool(_first_payload_value(
+        payload,
+        "stage_b_completed_at_utc",
+        "stage_state.stage_b_completed_at_utc",
+        "analysis_report.stage_b_completed_at_utc",
+    ))
+    debug_uploaded = _truthy(_first_payload_value(
+        payload,
+        "debug_brief.uploaded",
+        "stage_state.debug_brief.uploaded",
+        "analysis_report.debug_brief.uploaded",
+    ))
+    return (export_accepted and (stage_done or debug_uploaded)) or (stage_done and _payload_has_download_pointer(payload))
+
+
 def _job_is_done(payload: Dict[str, Any]) -> bool:
-    return str(payload.get("status", "")).lower() in {"done", "completed", "success"}
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or payload.get("job_status") or payload.get("state") or "").lower()
+    if status in {"done", "completed", "complete", "success", "succeeded", "finished", "download_ready"}:
+        return True
+    if _payload_has_finished_artifact(payload):
+        return True
+    return False
 
 
 def _job_is_failed(payload: Dict[str, Any]) -> bool:
-    return str(payload.get("status", "")).lower() in {"failed", "error"}
+    status = str(payload.get("status") or payload.get("job_status") or payload.get("state") or "").lower()
+    return status in {"failed", "error"}
 
 
 def _job_is_active(payload: Dict[str, Any]) -> bool:
